@@ -13,6 +13,8 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -23,6 +25,11 @@ public class TestCaseFetcher {
     private final TestCaseParser parser;
     private final AppProperties appProps;
     private final Set<String> allowedHosts;
+
+    // Ищет имя _index.md, _index_2.md, __index.md, __index_3.md
+    // и захватывает префикс до него
+    private static final Pattern INDEX_PATTERN =
+            Pattern.compile("^(.*?)__?index(?:_\\d+)?\\.md$");
 
     public TestCaseFetcher(RestClient fileFetchRestClient,
                            TestCaseParser parser,
@@ -43,8 +50,8 @@ public class TestCaseFetcher {
         }
         String trimmed = sourceUrl.trim();
 
-        // Прямой URL на _index.md
-        if (trimmed.endsWith("_index.md")) {
+        // Прямой URL на _index.md (или _index_2.md и т.п.)
+        if (trimmed.endsWith(".md")) {
             log.info("Скачиваем индекс напрямую: {}", trimmed);
             String indexMd = get(trimmed);
 
@@ -53,6 +60,7 @@ public class TestCaseFetcher {
             String prefix = extractPrefix(indexFilename);
 
             if (!parser.isIndexMarkdown(indexMd)) {
+                // Это не _index.md, а конкретный тест-кейс
                 return List.of(parseSingle(trimmed, indexMd));
             }
             return fetchFromIndex(indexMd, baseDirUrl, prefix);
@@ -74,14 +82,23 @@ public class TestCaseFetcher {
         }
     }
 
+    /**
+     * Извлекает префикс из имени файла индекса.
+     * Примеры:
+     * "5eb5fb63-..._OPE__index.md"      -> "5eb5fb63-..._OPE_"
+     * "5eb5fb63-..._OPE__index_2.md"    -> "5eb5fb63-..._OPE_"
+     * "abc_index.md"                    -> "abc_"
+     * "_index.md"                       -> ""
+     */
     private String extractPrefix(String indexFilename) {
         if (indexFilename == null || indexFilename.isEmpty()) return "";
-        if (indexFilename.equals("_index.md")) return "";
-        if (indexFilename.endsWith("__index.md")) {
-            return indexFilename.substring(0, indexFilename.length() - "__index.md".length()) + "_";
-        }
-        if (indexFilename.endsWith("_index.md")) {
-            return indexFilename.substring(0, indexFilename.length() - "_index.md".length()) + "_";
+        Matcher m = INDEX_PATTERN.matcher(indexFilename);
+        if (m.matches()) {
+            String prefix = m.group(1);
+            // Если в конце префикса уже есть _ (например, "abc_"), вернём как есть
+            // Если нет — добавим _, чтобы было "abc_" + "TC-..."
+            if (prefix.isEmpty()) return "";
+            return prefix.endsWith("_") ? prefix : prefix + "_";
         }
         return "";
     }
@@ -100,6 +117,7 @@ public class TestCaseFetcher {
                 continue;
             }
 
+            // Если в _index.md ссылка уже с префиксом — не дублируем
             String actualFilename = relFilename;
             if (!prefix.isEmpty() && !relFilename.startsWith(prefix)) {
                 actualFilename = prefix + relFilename;
