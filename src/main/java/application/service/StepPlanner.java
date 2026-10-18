@@ -28,11 +28,16 @@ public class StepPlanner {
             String path,
             String bodyJson,
             Integer expectedStatus,
+            String topicKey,
             String question,
             String reason
     ) {
         public boolean needsClarification() {
             return "needClarification".equalsIgnoreCase(operation);
+        }
+
+        public boolean isSkip() {
+            return "skip".equalsIgnoreCase(operation);
         }
     }
 
@@ -47,14 +52,15 @@ public class StepPlanner {
         user.append("Ожидаемый результат всего кейса: ").append(tc.expectedResult()).append("\n\n");
         user.append("Шаг #").append(stepIndex + 1).append(": ").append(stepText).append("\n\n");
 
-        // Передаём ответы пользователя — это критично для цикла уточнений
         if (tc.answers() != null && !tc.answers().isEmpty()) {
             user.append("Ранее пользователь ответил на уточнения:\n");
             for (AnswerRequest.Answer a : tc.answers()) {
                 user.append("- Вопрос: ").append(a.question()).append("\n");
                 user.append("  Ответ: ").append(a.answer()).append("\n");
             }
-            user.append("\nИспользуй эти ответы при планировании шага. Не задавай повторно те же вопросы.\n\n");
+            user.append("\nИспользуй эти ответы при планировании шага. ");
+            user.append("Не задавай повторно те же вопросы. ");
+            user.append("Если ответ равен SKIP — верни operation=\"skip\".\n\n");
         }
 
         if (uiHtmlSnapshot != null && !uiHtmlSnapshot.isBlank()) {
@@ -81,6 +87,7 @@ public class StepPlanner {
                     str(map.get("path")),
                     str(map.get("bodyJson")),
                     map.get("expectedStatus") instanceof Number n ? n.intValue() : null,
+                    str(map.get("topicKey")),
                     str(map.get("question")),
                     str(map.get("reason"))
             );

@@ -30,43 +30,48 @@ app:
       - тип кейса (UI или API);
       - ответы пользователя на ранее заданные уточнения (если есть);
       - контекст: для UI — фрагмент HTML текущей страницы; для API — базовый URL (если известен).
-      
+
       Твоя задача — преобразовать шаг в ОДНУ конкретную операцию.
       Ответ — ТОЛЬКО валидный JSON, без markdown-обёрток.
-      
+
       Формат ответа:
-      {"operation": "navigate|click|fill|assertText|apiCall|needClarification",
+      {"operation": "navigate|click|fill|assertText|apiCall|skip|needClarification",
        "locator": "CSS-селектор (для UI)",
        "value": "значение для fill/assertText/navigate",
        "method": "GET|POST|PUT|DELETE|PATCH (для apiCall)",
        "path": "/path или полный URL (для apiCall)",
        "bodyJson": "{}",
        "expectedStatus": 200,
+       "topicKey": "краткий ключ темы уточнения (только для needClarification)",
        "question": "вопрос пользователю (если needClarification)",
        "reason": "почему не хватает данных"}
-      
+
       ЖЁСТКИЕ ПРАВИЛА:
-      1. ОБЯЗАТЕЛЬНО используй ответы пользователя из блока «Ранее пользователь ответил». 
-         Если пользователь дал URL — используй его для navigate (в поле value) 
-         или для apiCall (в поле path, если URL полный). 
+      1. ОБЯЗАТЕЛЬНО используй ответы пользователя из блока «Ранее пользователь ответил».
+         Если пользователь дал URL — используй его для navigate (в поле value)
+         или для apiCall (в поле path, если URL полный).
          Если ответ снимает неопределённость шага — НЕ ЗАПРАШИВАЙ уточнение повторно.
-      2. Не выдумывай бизнес-логику и данные. Если шаг требует конкретное значение, 
+      2. Не выдумывай бизнес-логику и данные. Если шаг требует конкретное значение,
          которого нет ни в тексте шага, ни в ответах пользователя — верни needClarification.
-      3. UI: используй ТОЛЬКО элементы, реально присутствующие в HTML. 
+      3. UI: используй ТОЛЬКО элементы, реально присутствующие в HTML.
          Если подходящего элемента нет — needClarification.
-      4. API: если пользователь дал полный URL — верни его в поле path 
-         (например, path="https://iss.moex.com/iss/..."). 
-         Если дал базу — верни path="/..." .
-      5. Для шага "открыть страницу" используй operation="navigate", 
+      4. API: если пользователь дал полный URL — верни его в поле path
+         (например, path="https://iss.moex.com/iss/..."), иначе path="/...".
+      5. Для шага «открыть страницу» используй operation="navigate",
          value=<URL из шага, или из ответа пользователя>.
-      6. Никаких дополнительных полей.
+      6. Если среди ответов пользователя уже есть ответ SKIP на вопрос
+         с той же темой — верни operation="skip", reason="пользователь запросил пропуск".
+      7. Поле topicKey обязательно для needClarification. Это короткий ключ темы
+         (до 40 символов), например: api_base_url, ui_locator_block, coordinates.
+         Для одного и того же topicKey задавай уточнение только один раз.
+      8. Никаких дополнительных полей.
 
 openrouter:
   base-url: https://openrouter.ai/api/v1
   api-key:
-  model: openrouter/free
-  max-output-tokens: 40000
-  timeout-seconds: 2400
+  model: anthropic/claude-haiku-5.5
+  max-output-tokens: 24000
+  timeout-seconds: 50000
   connect-timeout-seconds: 30
   referer: http://localhost:8083
   title: test-runner

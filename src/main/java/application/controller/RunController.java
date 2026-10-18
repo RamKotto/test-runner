@@ -58,14 +58,12 @@ public class RunController {
         log.info("Ответы на уточнения для taskId={}: {}", taskId,
                 request.answers() == null ? 0 : request.answers().size());
 
-        // Накопленные ответы: старые + новые
         List<AnswerRequest.Answer> allAnswers = new ArrayList<>(
                 session.answers() == null ? List.of() : session.answers());
         if (request.answers() != null) {
             allAnswers.addAll(request.answers());
         }
 
-        // Продолжаем с сохранённого индекса
         List<ParsedTestCase> remaining = session.testCases()
                 .subList(session.currentTestCaseIndex(), session.testCases().size());
 
@@ -101,26 +99,28 @@ public class RunController {
         for (int i = 0; i < cases.size(); i++) {
             ParsedTestCase tc = cases.get(i);
 
-            // Обогащаем кейс ответами (заменяем answers на накопленные)
             ParsedTestCase tcWithAnswers = new ParsedTestCase(
                     tc.id(), tc.type(), tc.title(), tc.requirementRef(),
                     tc.preconditions(), tc.steps(), tc.expectedResult(),
                     tc.priority(), tc.sourceFilename(), tc.rawMarkdown(),
                     answers);
 
-            var outcome = runner.runCase(tcWithAnswers, startUrl, apiBaseUrl);
+            TestCaseRunnerService.RunnerOutcome result =
+                    runner.runCase(tcWithAnswers, startUrl, apiBaseUrl);
+            ExecutionOutcome outcome = result.outcome();
 
-            // Обогащённый MD сохраняется всегда, обогащение строго под шагами
-            String enriched = renderer.renderEnriched(tc, outcome.outcome().enrichments());
+            String enriched = renderer.renderEnriched(tc, outcome.enrichments());
             storage.save(tc.sourceFilename(), enriched);
 
-            outcomes.add(outcome.outcome());
+            outcomes.add(outcome);
 
-            if ("NEEDS_CLARIFICATION".equals(outcome.outcome().status())) {
-                clarifications.addAll(outcome.clarifications());
+            if ("NEEDS_CLARIFICATION".equals(outcome.status())) {
+                clarifications.addAll(result.clarifications());
                 stoppedAt = i;
                 return new RunExecution(outcomes, clarifications, stoppedAt);
             }
+
+            // SKIPPED и FAILED не прерывают прогон — переходим к следующему кейсу
         }
         return new RunExecution(outcomes, clarifications, stoppedAt);
     }

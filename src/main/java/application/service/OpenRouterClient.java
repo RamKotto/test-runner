@@ -32,9 +32,10 @@ public class OpenRouterClient {
                 Map.of("role", "system", "content", systemPrompt),
                 Map.of("role", "user", "content", userText)
         ));
-        body.put("temperature", 0.0);
         body.put("max_tokens", props.getMaxOutputTokens());
         body.put("response_format", Map.of("type", "json_object"));
+        // Haiku 5.5: temperature не принимается, управляем через reasoning.effort
+        body.put("reasoning", Map.of("effort", "high"));
 
         try {
             Map<String, Object> response = http.post()
@@ -61,7 +62,6 @@ public class OpenRouterClient {
 
             Object content = message.get("content");
 
-            // Fallback: некоторые модели кладут ответ в reasoning_content
             if (content == null || content.toString().isBlank()) {
                 Object reasoning = message.get("reasoning_content");
                 if (reasoning != null && !reasoning.toString().isBlank()) {
@@ -71,7 +71,6 @@ public class OpenRouterClient {
                 }
             }
 
-            // Fallback: tool_calls (если модель выбрала function calling)
             if (content == null || content.toString().isBlank()) {
                 Object toolCalls = message.get("tool_calls");
                 if (toolCalls instanceof List<?> list && !list.isEmpty()) {
