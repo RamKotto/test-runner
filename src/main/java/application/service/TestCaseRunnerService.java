@@ -1,9 +1,6 @@
 package application.service;
 
-import application.dto.Dtos.Clarification;
-import application.dto.Dtos.ExecutionOutcome;
-import application.dto.Dtos.ParsedTestCase;
-import application.dto.Dtos.StepEnrichment;
+import application.dto.Dtos.*;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -28,8 +25,38 @@ public class TestCaseRunnerService {
     }
 
     public RunnerOutcome runCase(ParsedTestCase tc, String startUrl, String apiBaseUrl) {
-        if (isApiType(tc.type())) return runApiCase(tc, apiBaseUrl);
-        return runUiCase(tc, startUrl);
+        // Если apiBaseUrl пуст, но в ответах есть URL — используем его
+        String effectiveApiBaseUrl = resolveApiBaseUrl(tc, apiBaseUrl);
+        String effectiveStartUrl = resolveStartUrl(tc, startUrl);
+
+        if (isApiType(tc.type())) return runApiCase(tc, effectiveApiBaseUrl);
+        return runUiCase(tc, effectiveStartUrl);
+    }
+
+    private String resolveApiBaseUrl(ParsedTestCase tc, String fallback) {
+        if (fallback != null && !fallback.isBlank()) return fallback;
+        if (tc.answers() == null) return null;
+        for (AnswerRequest.Answer a : tc.answers()) {
+            String ans = a.answer();
+            if (ans != null && (ans.startsWith("http://") || ans.startsWith("https://"))) {
+                log.info("apiBaseUrl взят из ответа пользователя: {}", ans);
+                return ans;
+            }
+        }
+        return fallback;
+    }
+
+    private String resolveStartUrl(ParsedTestCase tc, String fallback) {
+        if (fallback != null && !fallback.isBlank()) return fallback;
+        if (tc.answers() == null) return null;
+        for (AnswerRequest.Answer a : tc.answers()) {
+            String ans = a.answer();
+            if (ans != null && (ans.startsWith("http://") || ans.startsWith("https://"))) {
+                log.info("startUrl взят из ответа пользователя: {}", ans);
+                return ans;
+            }
+        }
+        return fallback;
     }
 
     private RunnerOutcome runUiCase(ParsedTestCase tc, String startUrl) {

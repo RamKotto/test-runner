@@ -67,7 +67,6 @@ public class TestCaseFetcher {
             if (!parser.isIndexMarkdown(indexMd)) {
                 return List.of(parseSingle(indexUrl, indexMd));
             }
-            // В этом случае префикса нет (файлы лежат как _index.md, TC-UI-001_...)
             return fetchFromIndex(indexMd, baseDirUrl, "");
         } catch (Exception e) {
             log.warn("Не удалось скачать _index.md ({}): {}", indexUrl, e.getMessage());
@@ -75,11 +74,6 @@ public class TestCaseFetcher {
         }
     }
 
-    /**
-     * Извлекает префикс из имени файла _index.md.
-     * Пример: "c0858aff-..._RBC__index.md" -> "c0858aff-..._RBC_"
-     * "_index.md" -> ""
-     */
     private String extractPrefix(String indexFilename) {
         if (indexFilename == null || indexFilename.isEmpty()) return "";
         if (indexFilename.equals("_index.md")) return "";
@@ -106,7 +100,6 @@ public class TestCaseFetcher {
                 continue;
             }
 
-            // Если в relFilename уже есть префикс (например, в _index.md указано полное имя) — не дублируем
             String actualFilename = relFilename;
             if (!prefix.isEmpty() && !relFilename.startsWith(prefix)) {
                 actualFilename = prefix + relFilename;
@@ -115,7 +108,6 @@ public class TestCaseFetcher {
             String fileUrl = baseDirUrl + actualFilename;
             try {
                 String md = get(fileUrl);
-                // Сохраняем с реальным именем, которое использовалось в URL
                 result.add(parser.parse(md, actualFilename));
                 saveCopy(actualFilename, md);
             } catch (Exception ex) {

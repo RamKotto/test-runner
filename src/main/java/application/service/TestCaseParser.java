@@ -14,9 +14,9 @@ public class TestCaseParser {
     private static final Pattern HEADER = Pattern.compile("^#\\s+(TC-[A-Z0-9\\-]+)\\s+[—-]\\s+(.+)$");
     private static final Pattern FIELD = Pattern.compile("^-\\s+\\*\\*([^*]+):\\*\\*\\s*(.+)$");
 
-    // Захватывает любую ссылку в скобках, заканчивающуюся на .md
+    // find() ищет подстроку: начало строки + ссылка в любом месте
     private static final Pattern INDEX_ENTRY =
-            Pattern.compile("^-\\s+\\[([^\\]]+)]\\(([^)]+\\.md)\\)");
+            Pattern.compile("\\[([^\\]]+)]\\(([^)]+\\.md)\\)");
 
     private static final Pattern SAFE_NAME = Pattern.compile("^([a-zA-Z0-9_\\-]+\\.md)$");
 
@@ -28,7 +28,7 @@ public class TestCaseParser {
         List<IndexEntry> result = new ArrayList<>();
         for (String line : md.split("\\R")) {
             Matcher m = INDEX_ENTRY.matcher(line.trim());
-            if (m.matches()) {
+            if (m.find()) {
                 String testCaseId = m.group(1);
                 String relPath = m.group(2);
                 result.add(new IndexEntry(testCaseId, relPath));
