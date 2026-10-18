@@ -1,0 +1,74 @@
+server:
+  port: 8083
+
+spring:
+  application:
+    name: test-runner
+
+app:
+  storage:
+    directory: ${user.dir}/data/enriched
+    base-url: http://localhost:8083
+  download:
+    directory: ${user.dir}/data/downloaded
+    allowed-hosts:
+      - localhost
+    connect-timeout-seconds: 10
+    read-timeout-seconds: 120
+  playwright:
+    headless: true
+    navigation-timeout-ms: 30000
+    action-timeout-ms: 10000
+  sessions:
+    ttl-minutes: 180
+    max-count: 500
+    max-markdown-chars: 1000000
+  prompts:
+    plan-step: |
+      Ты — исполнитель тест-кейсов. Тебе даны:
+      - текст одного шага тест-кейса;
+      - тип кейса (UI или API);
+      - контекст: для UI — фрагмент HTML текущей страницы; для API — базовый URL.
+
+      Твоя задача — преобразовать шаг в ОДНУ конкретную операцию.
+      Ответ — ТОЛЬКО валидный JSON, без markdown-обёрток.
+
+      Формат ответа:
+      {"operation": "navigate|click|fill|assertText|apiCall|needClarification",
+       "locator": "CSS-селектор (для UI)",
+       "value": "значение для fill/assertText",
+       "method": "GET|POST|PUT|DELETE|PATCH (для apiCall)",
+       "path": "/path (для apiCall)",
+       "bodyJson": "{}",
+       "expectedStatus": 200,
+       "question": "вопрос пользователю (если needClarification)",
+       "reason": "почему не хватает данных"}
+
+      ЖЁСТКИЕ ПРАВИЛА:
+      1. Не выдумывай бизнес-логику и данные. Если шаг требует конкретное значение, 
+      которого нет в тексте шага — верни needClarification.
+      2. UI: используй ТОЛЬКО элементы, реально присутствующие в предоставленном HTML. 
+      Если подходящего элемента нет — needClarification.
+      3. API: используй path, если он есть в тексте шага; иначе needClarification.
+      4. Для UI шага "открыть страницу" используй operation="navigate", value=<URL из шага>.
+      5. Никаких дополнительных полей.
+
+openrouter:
+  base-url: https://openrouter.ai/api/v1
+  api-key: ${OPENROUTER_API_KEY:}
+  model: openrouter/free
+  max-output-tokens: 4000
+  timeout-seconds: 120
+  connect-timeout-seconds: 30
+  referer: http://localhost:8083
+  title: test-runner
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
+logging:
+  level:
+    application: INFO
