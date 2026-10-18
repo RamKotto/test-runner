@@ -1,0 +1,352 @@
+{
+  "info": {
+    "name": "test-runner",
+    "description": "Исполнение тест-кейсов md-to-tests через Playwright/RestAssured + OpenRouter. Обогащение локаторами/URL строго под шагами. Цикл уточнений через /answers.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8083", "type": "string" },
+    { "key": "mdToTestsUrl", "value": "http://localhost:8082/api/files/", "type": "string" },
+    { "key": "startUrl", "value": "http://localhost:3000", "type": "string" },
+    { "key": "apiBaseUrl", "value": "http://localhost:3000/api", "type": "string" },
+    { "key": "taskId", "value": "", "type": "string" },
+    { "key": "lastStatus", "value": "", "type": "string" },
+    { "key": "firstResultFilename", "value": "", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "1. Прогнать все тест-кейсы",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const json = pm.response.json();",
+              "pm.test('status 200', () => pm.response.to.have.status(200));",
+              "pm.test('has taskId', () => pm.expect(json.taskId).to.be.a('string').that.is.not.empty);",
+              "pm.test('status valid', () => pm.expect(json.status).to.be.oneOf(['DONE','NEEDS_CLARIFICATION']));",
+              "pm.test('outcomes array', () => pm.expect(json.outcomes).to.be.an('array').that.is.not.empty);",
+              "pm.collectionVariables.set('taskId', json.taskId);",
+              "pm.collectionVariables.set('lastStatus', json.status);",
+              "if (Array.isArray(json.outcomes) && json.outcomes.length > 0) {",
+              "  const first = json.outcomes[0];",
+              "  if (first.filename) pm.collectionVariables.set('firstResultFilename', first.filename);",
+              "}",
+              "if (Array.isArray(json.outcomes)) {",
+              "  json.outcomes.forEach(o => {",
+              "    pm.test('outcome has testCaseId', () => pm.expect(o.testCaseId).to.be.a('string').that.is.not.empty);",
+              "    pm.test('outcome status valid', () => pm.expect(o.status).to.be.oneOf(['PASSED','FAILED','NEEDS_CLARIFICATION']));",
+              "    pm.test('enrichments is array', () => pm.expect(o.enrichments).to.be.an('array'));",
+              "    if (Array.isArray(o.enrichments)) {",
+              "      o.enrichments.forEach(e => {",
+              "        pm.test('enrichment has stepIndex', () => pm.expect(e.stepIndex).to.be.a('number').that.is.at.least(0));",
+              "        pm.test('enrichment has action', () => pm.expect(e.action).to.be.a('string').that.is.not.empty);",
+              "        pm.test('enrichment has detail', () => pm.expect(e.detail).to.be.a('string').that.is.not.empty);",
+              "      });",
+              "    }",
+              "  });",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"sourceUrl\": \"{{mdToTestsUrl}}\",\n  \"startUrl\": \"{{startUrl}}\",\n  \"apiBaseUrl\": \"{{apiBaseUrl}}\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/run",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "run"]
+        },
+        "description": "Скачивает _index.md и все тест-кейсы с md-to-tests, прогоняет их. Если status=NEEDS_CLARIFICATION — переходите к шагу 2."
+      },
+      "response": []
+    },
+    {
+      "name": "1a. Прогон без startUrl (только API)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const json = pm.response.json();",
+              "pm.test('status 200', () => pm.response.to.have.status(200));",
+              "pm.test('status valid', () => pm.expect(json.status).to.be.oneOf(['DONE','NEEDS_CLARIFICATION']));",
+              "pm.collectionVariables.set('taskId', json.taskId);",
+              "pm.collectionVariables.set('lastStatus', json.status);"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"sourceUrl\": \"{{mdToTestsUrl}}\",\n  \"apiBaseUrl\": \"{{apiBaseUrl}}\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/run",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "run"]
+        },
+        "description": "Только API-кейсы. UI-кейсы, если попадутся, вернут уточнение о недостающем startUrl."
+      },
+      "response": []
+    },
+    {
+      "name": "1b. SSRF: запрещённый хост → 400",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('status 400', () => pm.response.to.have.status(400));",
+              "const json = pm.response.json();",
+              "pm.test('mentions host', () => pm.expect(json.message).to.include('Хост не разрешён'));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"sourceUrl\": \"http://169.254.169.254/latest/meta-data/\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/run",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "run"]
+        },
+        "description": "SSRF-allowlist: чужой хост в sourceUrl → 400."
+      },
+      "response": []
+    },
+    {
+      "name": "1c. Пустой sourceUrl → 400",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('status 400', () => pm.response.to.have.status(400));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"sourceUrl\": \"\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/run",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "run"]
+        },
+        "description": "Пустой sourceUrl → 400."
+      },
+      "response": []
+    },
+    {
+      "name": "2. Ответить на уточнения",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "if (pm.collectionVariables.get('lastStatus') === 'DONE') {",
+              "  console.log('Skipping answers: status=DONE');",
+              "  pm.execution.skipRequest();",
+              "}",
+              "if (!pm.collectionVariables.get('taskId')) {",
+              "  console.log('Skipping answers: no taskId');",
+              "  pm.execution.skipRequest();",
+              "}"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const json = pm.response.json();",
+              "pm.test('status 200', () => pm.response.to.have.status(200));",
+              "pm.test('status valid', () => pm.expect(json.status).to.be.oneOf(['DONE','NEEDS_CLARIFICATION']));",
+              "pm.collectionVariables.set('lastStatus', json.status);",
+              "if (json.status === 'DONE') {",
+              "  pm.collectionVariables.unset('taskId');",
+              "}",
+              "if (Array.isArray(json.outcomes)) {",
+              "  json.outcomes.forEach(o => {",
+              "    pm.expect(o.status).to.be.oneOf(['PASSED','FAILED','NEEDS_CLARIFICATION']);",
+              "    pm.expect(o.enrichments).to.be.an('array');",
+              "  });",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"answers\": [\n    {\n      \"question\": \"Шаг 4: локатор кнопки оплаты\",\n      \"answer\": \"Кнопка имеет id='pay-btn', класс 'btn-primary', текст 'Оплатить'\"\n    },\n    {\n      \"question\": \"Укажите host для API\",\n      \"answer\": \"http://localhost:3000/api\"\n    }\n  ]\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/run/{{taskId}}/answers",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "run", "{{taskId}}", "answers"]
+        },
+        "description": "Отправляет ответы на clarifications. Прогон продолжится с того же тест-кейса. Обогащение появится под шагом, где было уточнение."
+      },
+      "response": []
+    },
+    {
+      "name": "2a. Ответ на истёкшую сессию → 400",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('status 400', () => pm.response.to.have.status(400));",
+              "const json = pm.response.json();",
+              "pm.test('mentions session', () => pm.expect(json.message).to.include('Сессия не найдена'));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"answers\": [\n    { \"question\": \"x\", \"answer\": \"y\" }\n  ]\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/run/00000000-0000-0000-0000-000000000000/answers",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "run", "00000000-0000-0000-0000-000000000000", "answers"]
+        },
+        "description": "Несуществующий taskId → 400 'Сессия не найдена или истекла'."
+      },
+      "response": []
+    },
+    {
+      "name": "3. Скачать обогащённый MD",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "if (!pm.collectionVariables.get('firstResultFilename')) {",
+              "  console.log('Skipping download: no filename');",
+              "  pm.execution.skipRequest();",
+              "}"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('status 200', () => pm.response.to.have.status(200));",
+              "pm.test('content-type markdown', () => pm.expect(pm.response.headers.get('Content-Type')).to.include('text/markdown'));",
+              "pm.test('content-disposition attachment', () => pm.expect(pm.response.headers.get('Content-Disposition')).to.include('attachment'));",
+              "const body = pm.response.text();",
+              "pm.test('has Шаги', () => pm.expect(body).to.include('## Шаги'));",
+              "pm.test('has enrichment marker', () => pm.expect(body).to.include('> 🔍'));",
+              "pm.test('has Ожидаемый результат', () => pm.expect(body).to.include('## Ожидаемый результат'));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/results/{{firstResultFilename}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "results", "{{firstResultFilename}}"]
+        },
+        "description": "Скачивает обогащённый MD. Обогащение пишется строкой '> 🔍' строго под шагом."
+      },
+      "response": []
+    },
+    {
+      "name": "3a. Path traversal → 400",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('status 400', () => pm.response.to.have.status(400));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/results/..%2F..%2Fetc%2Fpasswd",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "results", "..%2F..%2Fetc%2Fpasswd"]
+        },
+        "description": "SAFE_NAME regex отклонит '..' и '/' → 400."
+      },
+      "response": []
+    },
+    {
+      "name": "4. Healthcheck",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('status 200', () => pm.response.to.have.status(200));",
+              "pm.test('status UP', () => pm.expect(pm.response.json().status).to.eql('UP'));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/actuator/health",
+          "host": ["{{baseUrl}}"],
+          "path": ["actuator", "health"]
+        },
+        "description": "Проверка состояния приложения."
+      },
+      "response": []
+    }
+  ]
+}
