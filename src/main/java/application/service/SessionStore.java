@@ -1,6 +1,7 @@
 package application.service;
 
 import application.config.AppProperties;
+import application.dto.Dtos.AnswerRequest;
 import application.dto.Dtos.ParsedTestCase;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
@@ -21,7 +22,8 @@ public class SessionStore {
             String startUrl,
             String apiBaseUrl,
             int currentTestCaseIndex,
-            Instant createdAt
+            Instant createdAt,
+            List<AnswerRequest.Answer> answers
     ) {
     }
 
@@ -37,7 +39,7 @@ public class SessionStore {
         }
         sessions.put(taskId, new Session(
                 session.testCases(), session.startUrl(), session.apiBaseUrl(),
-                session.currentTestCaseIndex(), Instant.now()));
+                session.currentTestCaseIndex(), Instant.now(), session.answers()));
     }
 
     public Session get(String taskId) {

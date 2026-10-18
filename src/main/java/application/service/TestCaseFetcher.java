@@ -38,37 +38,86 @@ public class TestCaseFetcher {
     }
 
     public List<ParsedTestCase> fetchAll(String sourceUrl) {
-        String baseDirUrl = normalizeDirUrl(sourceUrl);
+        if (sourceUrl == null || sourceUrl.isBlank()) {
+            throw new IllegalArgumentException("sourceUrl обязателен");
+        }
+        String trimmed = sourceUrl.trim();
+
+        // Прямой URL на _index.md
+        if (trimmed.endsWith("_index.md")) {
+            log.info("Скачиваем индекс напрямую: {}", trimmed);
+            String indexMd = get(trimmed);
+
+            String baseDirUrl = trimmed.substring(0, trimmed.lastIndexOf('/') + 1);
+            String indexFilename = trimmed.substring(trimmed.lastIndexOf('/') + 1);
+            String prefix = extractPrefix(indexFilename);
+
+            if (!parser.isIndexMarkdown(indexMd)) {
+                return List.of(parseSingle(trimmed, indexMd));
+            }
+            return fetchFromIndex(indexMd, baseDirUrl, prefix);
+        }
+
+        // URL директории
+        String baseDirUrl = normalizeDirUrl(trimmed);
         String indexUrl = baseDirUrl + "_index.md";
 
-        List<TestCaseParser.IndexEntry> entries;
         try {
             String indexMd = get(indexUrl);
             if (!parser.isIndexMarkdown(indexMd)) {
                 return List.of(parseSingle(indexUrl, indexMd));
             }
-            entries = parser.parseIndex(indexMd);
+            // В этом случае префикса нет (файлы лежат как _index.md, TC-UI-001_...)
+            return fetchFromIndex(indexMd, baseDirUrl, "");
         } catch (Exception e) {
             log.warn("Не удалось скачать _index.md ({}): {}", indexUrl, e.getMessage());
             throw new FetchException("Не удалось получить _index.md по " + indexUrl, e);
         }
+    }
 
+    /**
+     * Извлекает префикс из имени файла _index.md.
+     * Пример: "c0858aff-..._RBC__index.md" -> "c0858aff-..._RBC_"
+     * "_index.md" -> ""
+     */
+    private String extractPrefix(String indexFilename) {
+        if (indexFilename == null || indexFilename.isEmpty()) return "";
+        if (indexFilename.equals("_index.md")) return "";
+        if (indexFilename.endsWith("__index.md")) {
+            return indexFilename.substring(0, indexFilename.length() - "__index.md".length()) + "_";
+        }
+        if (indexFilename.endsWith("_index.md")) {
+            return indexFilename.substring(0, indexFilename.length() - "_index.md".length()) + "_";
+        }
+        return "";
+    }
+
+    private List<ParsedTestCase> fetchFromIndex(String indexMd, String baseDirUrl, String prefix) {
+        List<TestCaseParser.IndexEntry> entries = parser.parseIndex(indexMd);
         if (entries.isEmpty()) {
-            throw new FetchException("_index.md не содержит ссылок на тест-кейсы: " + indexUrl);
+            throw new FetchException("_index.md не содержит ссылок на тест-кейсы: " + baseDirUrl);
         }
 
         List<ParsedTestCase> result = new ArrayList<>();
         for (var e : entries) {
-            String filename = parser.toSafeFilename(e.relativePath());
-            if (filename == null) {
+            String relFilename = parser.toSafeFilename(e.relativePath());
+            if (relFilename == null) {
                 log.warn("Пропускаю некорректное имя файла из index: {}", e.relativePath());
                 continue;
             }
-            String fileUrl = baseDirUrl + filename;
+
+            // Если в relFilename уже есть префикс (например, в _index.md указано полное имя) — не дублируем
+            String actualFilename = relFilename;
+            if (!prefix.isEmpty() && !relFilename.startsWith(prefix)) {
+                actualFilename = prefix + relFilename;
+            }
+
+            String fileUrl = baseDirUrl + actualFilename;
             try {
                 String md = get(fileUrl);
-                result.add(parser.parse(md, filename));
-                saveCopy(filename, md);
+                // Сохраняем с реальным именем, которое использовалось в URL
+                result.add(parser.parse(md, actualFilename));
+                saveCopy(actualFilename, md);
             } catch (Exception ex) {
                 log.warn("Не удалось скачать {}: {}", fileUrl, ex.getMessage());
             }
@@ -120,7 +169,6 @@ public class TestCaseFetcher {
     }
 
     private String normalizeDirUrl(String url) {
-        if (url == null || url.isBlank()) throw new IllegalArgumentException("sourceUrl обязателен");
         String trimmed = url.trim();
         if (trimmed.endsWith(".md")) {
             int slash = trimmed.lastIndexOf('/');

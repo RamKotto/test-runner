@@ -13,8 +13,11 @@ public class TestCaseParser {
 
     private static final Pattern HEADER = Pattern.compile("^#\\s+(TC-[A-Z0-9\\-]+)\\s+[—-]\\s+(.+)$");
     private static final Pattern FIELD = Pattern.compile("^-\\s+\\*\\*([^*]+):\\*\\*\\s*(.+)$");
+
+    // Захватывает любую ссылку в скобках, заканчивающуюся на .md
     private static final Pattern INDEX_ENTRY =
-            Pattern.compile("^-\\s+\\[(TC-[A-Z0-9\\-]+)]\\(([^)]+\\.md)\\)\\s+[—-]\\s+(.+)$");
+            Pattern.compile("^-\\s+\\[([^\\]]+)]\\(([^)]+\\.md)\\)");
+
     private static final Pattern SAFE_NAME = Pattern.compile("^([a-zA-Z0-9_\\-]+\\.md)$");
 
     public boolean isIndexMarkdown(String md) {
@@ -25,13 +28,20 @@ public class TestCaseParser {
         List<IndexEntry> result = new ArrayList<>();
         for (String line : md.split("\\R")) {
             Matcher m = INDEX_ENTRY.matcher(line.trim());
-            if (m.matches()) result.add(new IndexEntry(m.group(1), m.group(2)));
+            if (m.matches()) {
+                String testCaseId = m.group(1);
+                String relPath = m.group(2);
+                result.add(new IndexEntry(testCaseId, relPath));
+            }
         }
         return result;
     }
 
     public String toSafeFilename(String relativePath) {
         String base = relativePath.replace("\\", "/");
+        if (base.startsWith("./")) {
+            base = base.substring(2);
+        }
         int slash = base.lastIndexOf('/');
         if (slash >= 0) base = base.substring(slash + 1);
         if (!SAFE_NAME.matcher(base).matches()) return null;
@@ -105,7 +115,7 @@ public class TestCaseParser {
         }
         if (type == null) type = "UI";
         return new ParsedTestCase(id, type, title, requirementRef, preconditions, steps,
-                expectedResult, priority, sourceFilename, markdown);
+                expectedResult, priority, sourceFilename, markdown, List.of());
     }
 
     public record IndexEntry(String testCaseId, String relativePath) {

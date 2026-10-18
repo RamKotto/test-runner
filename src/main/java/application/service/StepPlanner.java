@@ -1,6 +1,7 @@
 package application.service;
 
 import application.config.AppProperties;
+import application.dto.Dtos.AnswerRequest;
 import application.dto.Dtos.ParsedTestCase;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -45,6 +46,17 @@ public class StepPlanner {
         user.append("Тест-кейс: ").append(tc.id()).append(" — ").append(tc.title()).append("\n");
         user.append("Ожидаемый результат всего кейса: ").append(tc.expectedResult()).append("\n\n");
         user.append("Шаг #").append(stepIndex + 1).append(": ").append(stepText).append("\n\n");
+
+        // Передаём ответы пользователя — это критично для цикла уточнений
+        if (tc.answers() != null && !tc.answers().isEmpty()) {
+            user.append("Ранее пользователь ответил на уточнения:\n");
+            for (AnswerRequest.Answer a : tc.answers()) {
+                user.append("- Вопрос: ").append(a.question()).append("\n");
+                user.append("  Ответ: ").append(a.answer()).append("\n");
+            }
+            user.append("\nИспользуй эти ответы при планировании шага. Не задавай повторно те же вопросы.\n\n");
+        }
+
         if (uiHtmlSnapshot != null && !uiHtmlSnapshot.isBlank()) {
             user.append("HTML текущей страницы (обрезан):\n");
             user.append(uiHtmlSnapshot.length() > 12000

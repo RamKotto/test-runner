@@ -31,7 +31,8 @@ public class RunController {
         }
         List<ParsedTestCase> testCases = fetcher.fetchAll(request.sourceUrl());
 
-        RunExecution exec = executeAll(testCases, request.startUrl(), request.apiBaseUrl());
+        RunExecution exec = executeAll(testCases, request.startUrl(), request.apiBaseUrl(),
+                List.of());
 
         String taskId = UUID.randomUUID().toString();
         String status = exec.clarifications.isEmpty() ? "DONE" : "NEEDS_CLARIFICATION";
@@ -39,7 +40,7 @@ public class RunController {
         if (!exec.clarifications.isEmpty()) {
             sessions.put(taskId, new SessionStore.Session(
                     testCases, request.startUrl(), request.apiBaseUrl(),
-                    exec.stoppedAtCaseIndex, Instant.now()));
+                    exec.stoppedAtCaseIndex, Instant.now(), List.of()));
         }
 
         String indexUrl = saveIndexAndReturnUrl(exec.outcomes);
@@ -57,10 +58,19 @@ public class RunController {
         log.info("Ответы на уточнения для taskId={}: {}", taskId,
                 request.answers() == null ? 0 : request.answers().size());
 
+        // Накопленные ответы: старые + новые
+        List<AnswerRequest.Answer> allAnswers = new ArrayList<>(
+                session.answers() == null ? List.of() : session.answers());
+        if (request.answers() != null) {
+            allAnswers.addAll(request.answers());
+        }
+
+        // Продолжаем с сохранённого индекса
         List<ParsedTestCase> remaining = session.testCases()
                 .subList(session.currentTestCaseIndex(), session.testCases().size());
 
-        RunExecution exec = executeAll(remaining, session.startUrl(), session.apiBaseUrl());
+        RunExecution exec = executeAll(remaining, session.startUrl(), session.apiBaseUrl(),
+                allAnswers);
         String status = exec.clarifications.isEmpty() ? "DONE" : "NEEDS_CLARIFICATION";
 
         if (exec.clarifications.isEmpty()) {
@@ -69,7 +79,7 @@ public class RunController {
             int absoluteIndex = session.currentTestCaseIndex() + exec.stoppedAtCaseIndex;
             sessions.put(taskId, new SessionStore.Session(
                     session.testCases(), session.startUrl(), session.apiBaseUrl(),
-                    absoluteIndex, Instant.now()));
+                    absoluteIndex, Instant.now(), allAnswers));
         }
 
         String indexUrl = saveIndexAndReturnUrl(exec.outcomes);
@@ -82,14 +92,23 @@ public class RunController {
                                 int stoppedAtCaseIndex) {
     }
 
-    private RunExecution executeAll(List<ParsedTestCase> cases, String startUrl, String apiBaseUrl) {
+    private RunExecution executeAll(List<ParsedTestCase> cases, String startUrl, String apiBaseUrl,
+                                    List<AnswerRequest.Answer> answers) {
         List<ExecutionOutcome> outcomes = new ArrayList<>();
         List<Clarification> clarifications = new ArrayList<>();
         int stoppedAt = 0;
 
         for (int i = 0; i < cases.size(); i++) {
             ParsedTestCase tc = cases.get(i);
-            var outcome = runner.runCase(tc, startUrl, apiBaseUrl);
+
+            // Обогащаем кейс ответами (заменяем answers на накопленные)
+            ParsedTestCase tcWithAnswers = new ParsedTestCase(
+                    tc.id(), tc.type(), tc.title(), tc.requirementRef(),
+                    tc.preconditions(), tc.steps(), tc.expectedResult(),
+                    tc.priority(), tc.sourceFilename(), tc.rawMarkdown(),
+                    answers);
+
+            var outcome = runner.runCase(tcWithAnswers, startUrl, apiBaseUrl);
 
             // Обогащённый MD сохраняется всегда, обогащение строго под шагами
             String enriched = renderer.renderEnriched(tc, outcome.outcome().enrichments());

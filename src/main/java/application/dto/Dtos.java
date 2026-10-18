@@ -49,7 +49,8 @@ public class Dtos {
             String expectedResult,
             String priority,
             String sourceFilename,
-            String rawMarkdown
+            String rawMarkdown,
+            List<AnswerRequest.Answer> answers
     ) {
     }
 }
