@@ -36,9 +36,9 @@ app:
       Ответ — ТОЛЬКО валидный JSON, без markdown-обёрток.
 
       Формат ответа:
-      {"operation": "navigate|click|fill|assertText|waitForText|apiCall|assertBody|assertHeader|parseJson|skip|needClarification",
+      {"operation": "navigate|click|fill|assertText|waitForText|apiCall|assertBody|assertHeader|assertStatus|parseJson|skip|needClarification",
        "locator": "CSS-селектор (для UI) или имя заголовка (для assertHeader)",
-       "value": "значение для fill/assertText/waitForText/assertBody/assertHeader/navigate",
+       "value": "значение для fill/assertText/waitForText/assertBody/assertHeader/assertStatus/navigate",
        "method": "GET|POST|PUT|DELETE|PATCH (для apiCall)",
        "path": "/path или полный URL (для apiCall)",
        "bodyJson": "{}",
@@ -56,7 +56,9 @@ app:
          Если подходящего элемента нет — needClarification. Для проверки наличия текста
          на странице используй assertText с locator body или waitForText, но не assertBody.
       4. API: если пользователь дал полный URL — верни его в поле path,
-         иначе path="/...". Метод по умолчанию GET.
+         иначе path="/...". Метод по умолчанию GET. Если ожидается код ошибки (4xx, 400),
+         укажи expectedStatus=400. Если в шаге сказано "любой из 4xx", верни operation="assertStatus",
+         value="4xx".
       5. Для шага «открыть страницу» используй operation="navigate",
          value=<URL из шага, или из ответа пользователя>.
       6. Для шага «дождаться загрузки/появления» используй operation="waitForText",
@@ -73,13 +75,13 @@ app:
          (до 40 символов), например: api_base_url, ui_locator_block, coordinates.
          Для одного и того же topicKey задавай уточнение только один раз в рамках кейса.
       10. Для проверки HTTP-заголовка последнего ответа используй operation="assertHeader".
-          locator = имя заголовка (например Content-Type), value = ожидаемое значение
-          (например application/json). Новый apiCall не выполняй — заголовки уже сохранены.
+          locator = имя заголовка (например Content-Type), value = ожидаемое значение.
       11. Если шаг требует проверить, что тело ответа является валидным JSON —
-          используй operation="parseJson" без value. Операция разбирает тело
-          последнего ответа стандартным JSON-парсером и падает, если JSON невалиден.
-          Новый apiCall не выполняй.
-      12. Никаких дополнительных полей.
+          используй operation="parseJson" без value.
+      12. Для проверки HTTP-статуса последнего ответа (если он еще не был проверен)
+          используй operation="assertStatus", value=<ожидаемый статус: "200", "400", "4xx">.
+          Новый apiCall не выполняй — статус уже сохранен.
+      13. Никаких дополнительных полей.
 
 openrouter:
   base-url: https://openrouter.ai/api/v1

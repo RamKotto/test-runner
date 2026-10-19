@@ -23,16 +23,8 @@ public class StepPlanner {
     private final ObjectMapper mapper;
 
     public record Plan(
-            String operation,
-            String locator,
-            String value,
-            String method,
-            String path,
-            String bodyJson,
-            Integer expectedStatus,
-            String topicKey,
-            String question,
-            String reason
+            String operation, String locator, String value, String method, String path,
+            String bodyJson, Integer expectedStatus, String topicKey, String question, String reason
     ) {
         public boolean needsClarification() {
             return "needClarification".equalsIgnoreCase(operation);
@@ -43,14 +35,9 @@ public class StepPlanner {
         }
     }
 
-    public Plan planStep(ParsedTestCase tc,
-                         int stepIndex,
-                         String stepText,
-                         String uiTextSnapshot,
-                         String apiBaseUrl,
-                         List<StepEnrichment> previousEnrichments,
-                         String lastResponseBody,
-                         Map<String, String> lastResponseHeaders) {
+    public Plan planStep(ParsedTestCase tc, int stepIndex, String stepText, String uiTextSnapshot,
+                         String apiBaseUrl, List<StepEnrichment> previousEnrichments,
+                         String lastResponseBody, Map<String, String> lastResponseHeaders, Integer lastStatusCode) {
         StringBuilder user = new StringBuilder();
         user.append("Тип кейса: ").append(tc.type()).append("\n");
         user.append("Тест-кейс: ").append(tc.id()).append(" — ").append(tc.title()).append("\n");
@@ -60,76 +47,50 @@ public class StepPlanner {
         if (tc.answers() != null && !tc.answers().isEmpty()) {
             user.append("Ранее пользователь ответил на уточнения в этом кейсе:\n");
             for (AnswerRequest.Answer a : tc.answers()) {
-                user.append("- Вопрос: ").append(a.question()).append("\n");
-                user.append("  Ответ: ").append(a.answer()).append("\n");
+                user.append("- Вопрос: ").append(a.question()).append("\n  Ответ: ").append(a.answer()).append("\n");
             }
-            user.append("\nИспользуй эти ответы. Не задавай повторно те же вопросы. ");
-            user.append("Если ответ равен SKIP — верни operation=\"skip\".\n\n");
+            user.append("\nИспользуй эти ответы. Если ответ равен SKIP — верни operation=\"skip\".\n\n");
         }
 
         if (previousEnrichments != null && !previousEnrichments.isEmpty()) {
             user.append("Уже выполненные шаги этого кейса:\n");
             for (StepEnrichment e : previousEnrichments) {
-                user.append("- Шаг ").append(e.stepIndex() + 1).append(": ")
-                        .append(e.action()).append(" → ").append(e.detail()).append("\n");
+                user.append("- Шаг ").append(e.stepIndex() + 1).append(": ").append(e.action()).append(" → ").append(e.detail()).append("\n");
             }
-            user.append("\nУчитывай это: если нужный API-запрос уже выполнен — используй его результат, ");
-            user.append("не повторяй запрос. Для проверки тела используй operation=\"assertBody\", ");
-            user.append("для проверки заголовка — operation=\"assertHeader\", ");
-            user.append("для проверки валидности JSON — operation=\"parseJson\".\n\n");
+            user.append("\nДля проверки тела используй assertBody, заголовка — assertHeader, валидности JSON — parseJson, статуса — assertStatus.\n\n");
         }
 
         if (uiTextSnapshot != null && !uiTextSnapshot.isBlank()) {
-            user.append("Видимый текст текущей страницы (обрезан):\n");
-            user.append(uiTextSnapshot.length() > 30000
-                    ? uiTextSnapshot.substring(0, 30000)
-                    : uiTextSnapshot);
-            user.append("\n");
+            user.append("Видимый текст текущей страницы:\n");
+            user.append(uiTextSnapshot.length() > 30000 ? uiTextSnapshot.substring(0, 30000) : uiTextSnapshot).append("\n");
         }
+        if (apiBaseUrl != null && !apiBaseUrl.isBlank()) user.append("\nAPI base URL: ").append(apiBaseUrl);
 
-        if (apiBaseUrl != null && !apiBaseUrl.isBlank()) {
-            user.append("\nAPI base URL: ").append(apiBaseUrl);
-        }
-
+        if (lastStatusCode != null)
+            user.append("\nHTTP статус последнего ответа: ").append(lastStatusCode).append("\n");
         if (lastResponseHeaders != null && !lastResponseHeaders.isEmpty()) {
             user.append("\nЗаголовки последнего ответа API:\n");
             for (Map.Entry<String, String> h : lastResponseHeaders.entrySet()) {
                 user.append("- ").append(h.getKey()).append(": ").append(h.getValue()).append("\n");
             }
-            user.append("Для проверки заголовка используй operation=\"assertHeader\", ");
-            user.append("locator=<имя заголовка>, value=<ожидаемое значение>.\n");
         }
-
         if (lastResponseBody != null && !lastResponseBody.isBlank()) {
-            user.append("\nТело последнего ответа API (обрезано):\n");
-            user.append(lastResponseBody.length() > 8000
-                    ? lastResponseBody.substring(0, 8000)
-                    : lastResponseBody);
-            user.append("\n");
+            user.append("\nТело последнего ответа API:\n").append(lastResponseBody.length() > 8000 ? lastResponseBody.substring(0, 8000) : lastResponseBody).append("\n");
         }
 
         String response = openRouter.complete(appProps.getPrompts().getPlanStep(), user.toString());
-        String cleaned = response.replaceAll("^```json\\s*", "")
-                .replaceAll("```\\s*$", "").trim();
+        String cleaned = response.replaceAll("^```json\\s*", "").replaceAll("```\\s*$", "").trim();
         try {
             Map<String, Object> map = mapper.readValue(cleaned, new TypeReference<>() {
             });
             return new Plan(
-                    str(map.get("operation")),
-                    str(map.get("locator")),
-                    str(map.get("value")),
-                    str(map.get("method")),
-                    str(map.get("path")),
-                    str(map.get("bodyJson")),
+                    str(map.get("operation")), str(map.get("locator")), str(map.get("value")),
+                    str(map.get("method")), str(map.get("path")), str(map.get("bodyJson")),
                     map.get("expectedStatus") instanceof Number n ? n.intValue() : null,
-                    str(map.get("topicKey")),
-                    str(map.get("question")),
-                    str(map.get("reason"))
+                    str(map.get("topicKey")), str(map.get("question")), str(map.get("reason"))
             );
         } catch (Exception e) {
-            log.error("Не удалось распарсить план шага: {}", cleaned, e);
-            throw new application.exception.GenerationException(
-                    "Модель вернула невалидный JSON для шага: " + e.getMessage(), e);
+            throw new application.exception.GenerationException("Модель вернула невалидный JSON: " + e.getMessage(), e);
         }
     }
 
