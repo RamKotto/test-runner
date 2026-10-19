@@ -15,8 +15,8 @@ public class TestCaseMarkdownRenderer {
 
     /**
      * Обогащение пишется СТРОГО под шагом, к которому относится.
-     * Многострочный detail рендерится с префиксом "   > 🔍" на каждой строке,
-     * чтобы markdown-блок оставался единым.
+     * Первая строка detail помечается "> 🔍", остальные — с отступом через ">",
+     * чтобы markdown-блок оставался единым, но префикс "🔍" не дублировался.
      */
     public String renderEnriched(ParsedTestCase tc, List<StepEnrichment> enrichments) {
         Map<Integer, StepEnrichment> byIndex = enrichments == null
@@ -43,8 +43,17 @@ public class TestCaseMarkdownRenderer {
             StepEnrichment e = byIndex.get(i);
             if (e != null && e.detail() != null && !e.detail().isBlank()) {
                 String[] lines = e.detail().split("\\R", -1);
-                for (String line : lines) {
-                    sb.append("   > 🔍 ").append(line).append("\n");
+                for (int j = 0; j < lines.length; j++) {
+                    String line = lines[j];
+                    if (j == 0) {
+                        sb.append("   > 🔍 ").append(line).append("\n");
+                    } else if (line.isEmpty()) {
+                        sb.append("   >\n");
+                    } else if (line.startsWith("   ")) {
+                        sb.append("   >").append(line).append("\n");
+                    } else {
+                        sb.append("   >    ").append(line).append("\n");
+                    }
                 }
             }
         }

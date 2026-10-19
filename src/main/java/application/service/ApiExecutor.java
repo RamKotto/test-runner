@@ -18,6 +18,8 @@ import java.util.Map;
 @Service
 public class ApiExecutor {
 
+    private static final int SAMPLE_BODY_LIMIT = 1_048_576; // 1 MiB
+
     private final ObjectMapper mapper = new ObjectMapper();
 
     public record ApiStepResult(StepEnrichment enrichment,
@@ -195,7 +197,6 @@ public class ApiExecutor {
         Integer expected = plan.expectedStatus();
         if (expected != null && actual != expected) {
             if (actual >= 500 && actual <= 599) {
-                // Сервер недоступен — это FAILED, а не повод для уточнения.
                 throw new AssertionFailure("API " + method + " " + fullUrl + " вернул " + actual
                         + " (сервер недоступен), ожидалось " + expected);
             }
@@ -223,11 +224,63 @@ public class ApiExecutor {
         String cl = findHeaderIgnoreCase(responseHeaders, "content-length");
         if (ct != null) sb.append("\n   • Content-Type: ").append(ct);
         if (cl != null) sb.append("\n   • Content-Length: ").append(cl);
-        if (body != null && !body.isBlank()) {
-            String trimmed = body.length() > 200 ? body.substring(0, 200) + "…" : body;
-            sb.append("\n   • sample body: ").append(trimmed.replace("\n", "\\n"));
+
+        if (body == null || body.isBlank()) {
+            return sb.toString();
+        }
+
+        String pretty = beautifyJsonIfPossible(body);
+        int totalChars = body.length();
+        boolean truncated = pretty.length() > SAMPLE_BODY_LIMIT;
+
+        String header;
+        if (truncated) {
+            int shown = SAMPLE_BODY_LIMIT;
+            int percent = totalChars == 0 ? 0 : (int) Math.round(100.0 * shown / totalChars);
+            header = "sample body (truncated at " + shown
+                    + " chars, total " + totalChars
+                    + " chars, " + percent + "%):";
+        } else {
+            header = "sample body:";
+        }
+        sb.append("\n   • ").append(header);
+
+        String toShow;
+        if (truncated) {
+            int cut = pretty.lastIndexOf('\n', SAMPLE_BODY_LIMIT);
+            if (cut <= 0) cut = SAMPLE_BODY_LIMIT;
+            toShow = pretty.substring(0, cut);
+        } else {
+            toShow = pretty;
+        }
+
+        for (String line : toShow.split("\\R", -1)) {
+            sb.append("\n       ").append(line);
+        }
+
+        if (truncated) {
+            sb.append("\n       …");
+            sb.append("\n   • ⚠️ WARNING: тело обрезано (")
+                    .append(totalChars).append(" chars всего, показано ")
+                    .append(SAMPLE_BODY_LIMIT)
+                    .append("). Полный размер — см. Content-Length или повторите запрос с фильтром параметров.");
         }
         return sb.toString();
+    }
+
+    /**
+     * Пытается распарсить тело как JSON и вернуть pretty-print.
+     * Если тело — не JSON (или парсинг упал) — возвращает как есть,
+     * чтобы не терять данные (например, plain-text ошибки).
+     */
+    private String beautifyJsonIfPossible(String body) {
+        try {
+            var node = mapper.readTree(body);
+            if (node == null) return body;
+            return mapper.writerWithDefaultPrettyPrinter().writeValueAsString(node);
+        } catch (Exception e) {
+            return body;
+        }
     }
 
     private String findHeaderIgnoreCase(Map<String, String> headers, String name) {

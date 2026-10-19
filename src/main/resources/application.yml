@@ -23,10 +23,6 @@ app:
     ttl-minutes: 180
     max-count: 500
     max-markdown-chars: 1000000
-  # По умолчанию дампы отключены. Включать для отладки:
-  #   mvn spring-boot:run -Dspring-boot.run.arguments=--app.debug.dump-html=true
-  # или переменная окружения APP_DEBUG_DUMP_HTML=true
-  # или профиль: SPRING_PROFILES_ACTIVE=debug (см. application-debug.yml)
   debug:
     dump-html: ${APP_DEBUG_DUMP_HTML:false}
   prompts:
@@ -109,12 +105,19 @@ app:
       19. Для проверки наличия текста на странице используй assertText с locator,
           указывающим на конкретный блок (pre, code, section), НЕ на "body".
           Исключение: если в шаге явно нужен весь текст страницы.
-      20. Для assertText по тексту внутри <pre>/<code> используй селектор
-          `pre:has-text("<подстрока>")` или `code:has-text("<подстрока>")` —
-          это даёт точный матч, а не весь body.
+      20. ВНУТРИ CSS-СЕЛЕКТОРА для :has-text(...) и подобных псевдоклассов
+          используй ТОЛЬКО ОДИНАРНЫЕ кавычки: `pre:has-text('curl')`.
+          Двойные кавычки ломают JSON-экранирование и Java-строки.
       21. Если предыдущий apiCall вернул 5xx — это FAILED, не планируй для него
           assertStatus и не запрашивай уточнение. Прогон кейса уже завершён.
       22. Никаких дополнительных полей.
+      23. Пояснения по sample body в ответе apiCall: сервер логирует тело
+          ПОЛНОСТЬЮ в beautified-виде (pretty-print JSON). Обрезка возможна
+          только если тело превышает 1 МБ (тогда увидишь пометку
+          "truncated at 1048576 chars, total N chars, P%" и ⚠️ WARNING).
+          Для типичных кейсов (forecast, current, error-ответы) тело
+          возвращается целиком — используй точные подстроки из него
+          для assertBody.
 
 openrouter:
   base-url: https://openrouter.ai/api/v1
