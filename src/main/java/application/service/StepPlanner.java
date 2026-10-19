@@ -49,7 +49,8 @@ public class StepPlanner {
                          String uiTextSnapshot,
                          String apiBaseUrl,
                          List<StepEnrichment> previousEnrichments,
-                         String lastResponseBody) {
+                         String lastResponseBody,
+                         Map<String, String> lastResponseHeaders) {
         StringBuilder user = new StringBuilder();
         user.append("Тип кейса: ").append(tc.type()).append("\n");
         user.append("Тест-кейс: ").append(tc.id()).append(" — ").append(tc.title()).append("\n");
@@ -74,7 +75,8 @@ public class StepPlanner {
             }
             user.append("\nУчитывай это: если нужный API-запрос уже выполнен — используй его результат, ");
             user.append("не повторяй запрос. Для проверки тела используй operation=\"assertBody\", ");
-            user.append("для проверки заголовка — operation=\"assertHeader\".\n\n");
+            user.append("для проверки заголовка — operation=\"assertHeader\", ");
+            user.append("для проверки валидности JSON — operation=\"parseJson\".\n\n");
         }
 
         if (uiTextSnapshot != null && !uiTextSnapshot.isBlank()) {
@@ -84,9 +86,20 @@ public class StepPlanner {
                     : uiTextSnapshot);
             user.append("\n");
         }
+
         if (apiBaseUrl != null && !apiBaseUrl.isBlank()) {
             user.append("\nAPI base URL: ").append(apiBaseUrl);
         }
+
+        if (lastResponseHeaders != null && !lastResponseHeaders.isEmpty()) {
+            user.append("\nЗаголовки последнего ответа API:\n");
+            for (Map.Entry<String, String> h : lastResponseHeaders.entrySet()) {
+                user.append("- ").append(h.getKey()).append(": ").append(h.getValue()).append("\n");
+            }
+            user.append("Для проверки заголовка используй operation=\"assertHeader\", ");
+            user.append("locator=<имя заголовка>, value=<ожидаемое значение>.\n");
+        }
+
         if (lastResponseBody != null && !lastResponseBody.isBlank()) {
             user.append("\nТело последнего ответа API (обрезано):\n");
             user.append(lastResponseBody.length() > 8000

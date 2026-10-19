@@ -30,7 +30,7 @@ public class TestCaseRunnerService {
         String effectiveApiBaseUrl = resolveApiBaseUrl(tc, apiBaseUrl);
         String effectiveStartUrl = resolveStartUrl(tc, startUrl);
 
-        if (isApiType(tc.type())) return runApiCase(tc, effectiveApiBaseUrl);
+        if (isApiType(tc)) return runApiCase(tc, effectiveApiBaseUrl);
         return runUiCase(tc, effectiveStartUrl);
     }
 
@@ -94,7 +94,7 @@ public class TestCaseRunnerService {
                 String step = tc.steps().get(i);
                 String text = uiExecutor.snapshotHtml(session);
                 StepPlanner.Plan plan = planner.planStep(tc, i, step, text, null,
-                        enrichments, null);
+                        enrichments, null, null);
 
                 if (plan.isSkip()) {
                     log.info("{} шаг {}: модель вернула skip", tc.id(), i + 1);
@@ -185,7 +185,7 @@ public class TestCaseRunnerService {
         for (int i = 0; i < tc.steps().size(); i++) {
             String step = tc.steps().get(i);
             StepPlanner.Plan plan = planner.planStep(tc, i, step, null, apiBaseUrl,
-                    enrichments, lastBody);
+                    enrichments, lastBody, lastHeaders);
 
             if (plan.isSkip()) {
                 log.info("{} шаг {}: модель вернула skip", tc.id(), i + 1);
@@ -276,7 +276,7 @@ public class TestCaseRunnerService {
         return new RunnerOutcome(
                 new ExecutionOutcome(tc.id(), tc.sourceFilename(), "SKIPPED", msg, enrichments),
                 List.of(),
-                true);
+                false);
     }
 
     private String normalizeTopic(String topicKey, String question, String reason) {
@@ -299,7 +299,22 @@ public class TestCaseRunnerService {
         return null;
     }
 
-    private boolean isApiType(String type) {
-        return type != null && type.equalsIgnoreCase("API");
+    /**
+     * Определяет, является ли кейс API-кейсом.
+     * Тип API — однозначно API.
+     * Тип NEGATIVE — API, если в шагах есть HTTP-запросы (GET/POST, URL, http-код, api.).
+     * Иначе — UI.
+     */
+    private boolean isApiType(ParsedTestCase tc) {
+        if (tc.type() == null) return false;
+        String t = tc.type().trim().toUpperCase();
+        if (t.equals("API")) return true;
+        if (t.equals("NEGATIVE")) {
+            String all = String.join(" ", tc.steps()).toLowerCase();
+            return all.contains("get-запрос") || all.contains("post-запрос")
+                    || all.contains("http://") || all.contains("https://")
+                    || all.contains("http-код") || all.contains("api.");
+        }
+        return false;
     }
 }
