@@ -10,6 +10,8 @@ import org.springframework.stereotype.Service;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 
 @Slf4j
 @Service
@@ -19,9 +21,6 @@ public class UiExecutor {
     private final Browser browser;
     private final AppProperties appProps;
 
-    /**
-     * Включается только профилем debug / переменной окружения.
-     */
     @Value("${app.debug.dump-html:false}")
     private boolean dumpHtmlEnabled;
 
@@ -44,10 +43,6 @@ public class UiExecutor {
         return new UiSession(ctx, page);
     }
 
-    /**
-     * Компактный DOM-снапшот: только интерактивные и "якорные" элементы с атрибутами.
-     * Отдаётся в LLM вместо innerText — чтобы модель могла выбрать реальный селектор.
-     */
     public String snapshotForPlanning(UiSession session) {
         try {
             return (String) session.page().evaluate("""
@@ -124,15 +119,15 @@ public class UiExecutor {
                 if (url == null) throw new LocatorNotResolved("не указан URL для навигации");
                 page.navigate(url);
                 return new StepEnrichment(stepIndex, "navigate",
-                        "navigate → `" + page.url() + "`");
+                        "navigate\n   • url: `" + page.url() + "`");
             }
             case "click": {
                 String loc = requireLocator(plan);
                 assertLocatorExists(page, loc);
                 LocatorInfo info = inspectLocator(page, loc);
                 page.locator(loc).click();
-                String detail = buildLocatorDetail("click → `" + loc + "`", info, plan, null);
-                return new StepEnrichment(stepIndex, "click", detail);
+                return new StepEnrichment(stepIndex, "click",
+                        buildLocatorDetail(page, "click", loc, null, info, plan, null));
             }
             case "fill": {
                 String loc = requireLocator(plan);
@@ -141,9 +136,8 @@ public class UiExecutor {
                 assertLocatorExists(page, loc);
                 LocatorInfo info = inspectLocator(page, loc);
                 page.locator(loc).fill(value);
-                String detail = buildLocatorDetail(
-                        "fill → `" + loc + "` = `" + value + "`", info, plan, null);
-                return new StepEnrichment(stepIndex, "fill", detail);
+                return new StepEnrichment(stepIndex, "fill",
+                        buildLocatorDetail(page, "fill", loc, value, info, plan, null));
             }
             case "assertText": {
                 String loc = requireLocator(plan);
@@ -153,16 +147,12 @@ public class UiExecutor {
                 LocatorInfo info = inspectLocator(page, loc);
                 String actual = page.locator(loc).innerText();
                 if (!actual.contains(expected)) {
-                    // Текст на странице есть, но другой — это FAILED, не уточнение.
                     throw new AssertionFailure(
                             "текст в `" + loc + "` = \"" + truncate(actual, 200)
                                     + "\" не содержит \"" + expected + "\"");
                 }
-                String snippet = actual.length() > 160 ? actual.substring(0, 160) + "…" : actual;
-                String detail = buildLocatorDetail(
-                        "assertText → `" + loc + "` содержит `" + expected + "`",
-                        info, plan, snippet);
-                return new StepEnrichment(stepIndex, "assertText", detail);
+                return new StepEnrichment(stepIndex, "assertText",
+                        buildLocatorDetail(page, "assertText", loc, expected, info, plan, actual));
             }
             case "waitForText": {
                 String expected = plan.value();
@@ -179,7 +169,7 @@ public class UiExecutor {
                             "текст `" + expected + "` не появился на странице за 10 секунд");
                 }
                 return new StepEnrichment(stepIndex, "waitForText",
-                        "waitForText → `body` содержит `" + expected + "`");
+                        "waitForText\n   • expected: `" + expected + "`");
             }
             case "assertBody": {
                 String expected = plan.value();
@@ -191,22 +181,93 @@ public class UiExecutor {
                     throw new AssertionFailure("текст в body не содержит `" + expected + "`");
                 }
                 return new StepEnrichment(stepIndex, "assertBody",
-                        "assertBody → `body` содержит `" + expected + "`");
+                        "assertBody\n   • expected: `" + expected + "`");
             }
             default:
                 throw new LocatorNotResolved("неподдерживаемая UI-операция: " + plan.operation());
         }
     }
 
-    /**
-     * Проверка локатора и подтягивание реальных атрибутов.
-     */
+    private String computeXPath(Page page, String locator) {
+        try {
+            Locator loc = page.locator(locator);
+            if (loc.count() == 0) return null;
+            Object result = loc.first().evaluate("""
+                        (el) => {
+                            const testid = el.getAttribute('data-testid')
+                                         || el.getAttribute('data-test-id')
+                                         || el.getAttribute('data-test');
+                            if (testid) {
+                                return `//*[@data-testid='${testid.replace(/'/g, "\\'")}']`;
+                            }
+                            if (el.id) {
+                                return `//*[@id='${el.id.replace(/'/g, "\\'")}']`;
+                            }
+                            const tag = el.tagName.toLowerCase();
+                            const text = (el.innerText || '').trim();
+                            if (['button', 'a', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'].includes(tag)
+                                && text && text.length <= 60 && !text.includes('\\n')) {
+                                return `//${tag}[normalize-space()='${text.replace(/'/g, "\\'")}']`;
+                            }
+                            if (['button', 'a', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'].includes(tag)
+                                && text && text.length > 60) {
+                                const short = text.slice(0, 40).replace(/'/g, "\\'");
+                                return `//${tag}[contains(normalize-space(), '${short}')]`;
+                            }
+                            const parts = [];
+                            let cur = el;
+                            while (cur && cur.nodeType === 1) {
+                                let part = cur.tagName.toLowerCase();
+                                const cid = cur.id;
+                                const ctestid = cur.getAttribute('data-testid');
+                                if (cid) { parts.unshift(`//*[@id='${cid.replace(/'/g, "\\'")}']`); break; }
+                                if (ctestid) { parts.unshift(`//*[@data-testid='${ctestid.replace(/'/g, "\\'")}']`); break; }
+                                const parent = cur.parentElement;
+                                if (parent) {
+                                    const siblings = Array.from(parent.children).filter(c => c.tagName === cur.tagName);
+                                    if (siblings.length > 1) {
+                                        const idx = siblings.indexOf(cur) + 1;
+                                        part += `[${idx}]`;
+                                    }
+                                }
+                                parts.unshift(part);
+                                cur = parent;
+                            }
+                            return '/' + parts.join('/');
+                        }
+                    """);
+            return result == null ? null : result.toString();
+        } catch (Exception e) {
+            log.debug("computeXPath failed for `{}`: {}", locator, e.getMessage());
+            return null;
+        }
+    }
+
+    private List<String> buildXPathAlternatives(Page page, String locator, StepPlanner.Plan plan) {
+        List<String> result = new ArrayList<>();
+        String computed = computeXPath(page, locator);
+        if (computed != null && !computed.isBlank()) {
+            result.add(computed);
+        }
+        String alts = plan.locatorAlternatives();
+        if (alts != null && !alts.isBlank() && !"null".equalsIgnoreCase(alts)) {
+            for (String alt : splitAlternatives(alts)) {
+                String a = alt.trim();
+                if (a.startsWith("xpath=")) a = a.substring("xpath=".length()).trim();
+                if (a.startsWith("//") || a.startsWith("/html") || a.startsWith("./")) {
+                    if (!result.contains(a)) result.add(a);
+                }
+            }
+        }
+        return result;
+    }
+
     private LocatorInfo inspectLocator(Page page, String locator) {
         try {
             Locator loc = page.locator(locator);
             int count = loc.count();
             if (count == 0) {
-                return new LocatorInfo(locator, 0, null, null, null, null, null, null);
+                return new LocatorInfo(locator, 0, null, null, null, null, null, null, null);
             }
             Locator first = loc.first();
             String tag = safeString(first.evaluate("e => e.tagName ? e.tagName.toLowerCase() : ''"));
@@ -214,26 +275,33 @@ public class UiExecutor {
             if (testid == null) testid = safeAttr(first, "data-test-id");
             if (testid == null) testid = safeAttr(first, "data-test");
             String id = safeAttr(first, "id");
+            String cls = safeAttr(first, "class");
             String role = safeAttr(first, "role");
             String aria = safeAttr(first, "aria-label");
             String type = safeAttr(first, "type");
             String text = safeString(first.innerText());
             if (text != null) {
-                text = text.trim().replaceAll("\\s+", " ");
-                if (text.length() > 80) text = text.substring(0, 80) + "…";
+                text = text.trim().replaceAll("[ \\t]+", " ");
             }
             return new LocatorInfo(locator, count, tag, testid != null ? testid : id,
-                    role, aria, text, type);
+                    cls, role, aria, type, text);
         } catch (Exception e) {
             log.debug("inspectLocator failed for `{}`: {}", locator, e.getMessage());
-            return new LocatorInfo(locator, -1, null, null, null, null, null, null);
+            return new LocatorInfo(locator, -1, null, null, null, null, null, null, null);
         }
     }
 
-    private String buildLocatorDetail(String header, LocatorInfo info, StepPlanner.Plan plan,
-                                      String snippet) {
-        StringBuilder sb = new StringBuilder(header);
+    private String buildLocatorDetail(Page page, String operation, String locator, String expected,
+                                      LocatorInfo info, StepPlanner.Plan plan, String actualText) {
+        StringBuilder sb = new StringBuilder(operation);
+
+        sb.append("\n   • locator: `").append(locator).append("`");
+        if (expected != null) {
+            sb.append("\n   • expected: `").append(expected).append("`");
+        }
+
         sb.append("\n   • matches: ").append(info.count() >= 0 ? info.count() : "unknown");
+
         if (info.tag() != null) {
             sb.append("\n   • element: <").append(info.tag());
             if (info.testidOrId() != null) {
@@ -241,56 +309,184 @@ public class UiExecutor {
                         && plan.locatorStrategy().toLowerCase().contains("testid");
                 if (isTestId) {
                     sb.append(" data-testid=\"").append(info.testidOrId()).append("\"");
-                } else {
+                } else if (info.testidOrId().matches("[a-zA-Z_][a-zA-Z0-9_\\-]*")) {
                     sb.append(" id=\"").append(info.testidOrId()).append("\"");
                 }
             }
+            if (info.cls() != null && !info.cls().isBlank()) {
+                sb.append(" class=\"").append(truncateSmart(info.cls(), 100)).append("\"");
+            }
             if (info.role() != null) sb.append(" role=\"").append(info.role()).append("\"");
-            if (info.ariaLabel() != null) sb.append(" aria-label=\"").append(info.ariaLabel()).append("\"");
             if (info.type() != null) sb.append(" type=\"").append(info.type()).append("\"");
             sb.append(">");
         }
+
         if (info.text() != null && !info.text().isBlank()) {
-            sb.append("\n   • text: \"").append(info.text()).append("\"");
+            sb.append("\n   • text: \"")
+                    .append(escapeQuotes(truncateSmart(info.text(), 200)))
+                    .append("\"");
         }
-        if (snippet != null && !snippet.isBlank()) {
-            sb.append("\n   • snippet: \"").append(snippet.replace("\n", "\\n")).append("\"");
-        }
+
         if (plan.locatorStrategy() != null && !plan.locatorStrategy().isBlank()) {
             sb.append("\n   • strategy: ").append(plan.locatorStrategy());
         }
 
-        String derivedRole = plan.elementRole();
+        String derivedRole = deriveRole(info);
         if (derivedRole == null || derivedRole.isBlank()) {
-            derivedRole = deriveRole(info);
+            derivedRole = plan.elementRole();
         }
         if (derivedRole != null && !derivedRole.isBlank()) {
             sb.append("\n   • role: ").append(derivedRole);
         }
 
-        String derivedName = plan.elementName();
-        if (derivedName == null || derivedName.isBlank()) {
-            derivedName = info.text();
+        String nameFromText = info.text();
+        String nameFromPlan = plan.elementName();
+        String chosenName = null;
+        if (nameFromText != null && !nameFromText.isBlank()) {
+            chosenName = nameFromText;
+        } else if (nameFromPlan != null && !nameFromPlan.isBlank()) {
+            chosenName = nameFromPlan;
         }
-        if (derivedName != null && !derivedName.isBlank()) {
-            sb.append("\n   • name: \"").append(derivedName).append("\"");
+        boolean nameDuplicatesText = chosenName != null && info.text() != null
+                && (chosenName.equals(info.text())
+                || info.text().startsWith(chosenName)
+                || (chosenName.length() >= 30 && info.text().startsWith(chosenName.substring(0, 30))));
+        if (chosenName != null && !chosenName.isBlank() && !nameDuplicatesText) {
+            sb.append("\n   • name: \"")
+                    .append(escapeQuotes(truncateSmart(chosenName, 80)))
+                    .append("\"");
         }
 
-        if (plan.locatorAlternatives() != null && !plan.locatorAlternatives().isBlank()
-                && !"null".equalsIgnoreCase(plan.locatorAlternatives())) {
-            sb.append("\n   • alternatives: ").append(plan.locatorAlternatives());
+        String alts = plan.locatorAlternatives();
+        if (alts != null && !alts.isBlank() && !"null".equalsIgnoreCase(alts)) {
+            List<String> cssAlts = new ArrayList<>();
+            for (String alt : splitAlternatives(alts)) {
+                String a = alt.trim();
+                if (!a.startsWith("//") && !a.startsWith("xpath=") && !a.startsWith("/html")
+                        && !a.startsWith("./")) {
+                    cssAlts.add(a);
+                }
+            }
+            if (!cssAlts.isEmpty()) {
+                sb.append("\n   • alternatives (css):");
+                for (String alt : cssAlts) sb.append("\n     - ").append(alt);
+            }
         }
+
+        List<String> xpathAlts = buildXPathAlternatives(page, locator, plan);
+        if (!xpathAlts.isEmpty()) {
+            sb.append("\n   • xpath:");
+            for (String xp : xpathAlts) sb.append("\n     - `").append(xp).append("`");
+        }
+
         if (info.count() > 1) {
             sb.append("\n   • ⚠️ WARNING: локатор матчит ")
                     .append(info.count())
-                    .append(" элементов — добавьте уточнение в локатор или обратитесь к разработчику");
+                    .append(" элементов — уточните селектор или обратитесь к разработчику");
+        }
+
+        if (actualText != null && info.text() != null && !actualText.equals(info.text())) {
+            String snippet = truncateSmart(actualText, 200);
+            if (!snippet.equals(truncateSmart(info.text(), 200))) {
+                sb.append("\n   • snippet: \"").append(escapeQuotes(snippet)).append("\"");
+            }
+        }
+
+        return sb.toString();
+    }
+
+    private static List<String> splitAlternatives(String alts) {
+        String s = alts.trim();
+        if (s.startsWith("[")) {
+            try {
+                var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+                var arr = mapper.readTree(s);
+                if (arr.isArray()) {
+                    List<String> out = new ArrayList<>();
+                    for (var n : arr) out.add(n.asText());
+                    return out;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        List<String> out = new ArrayList<>();
+        StringBuilder cur = new StringBuilder();
+        int depth = 0;
+        char quote = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (quote != 0) {
+                cur.append(c);
+                if (c == quote) quote = 0;
+            } else if (c == '\'' || c == '"') {
+                quote = c;
+                cur.append(c);
+            } else if (c == '(') {
+                depth++;
+                cur.append(c);
+            } else if (c == ')') {
+                depth--;
+                cur.append(c);
+            } else if (c == ',' && depth == 0) {
+                String t = cur.toString().trim();
+                if (!t.isEmpty()) out.add(stripQuotes(t));
+                cur.setLength(0);
+            } else {
+                cur.append(c);
+            }
+        }
+        String t = cur.toString().trim();
+        if (!t.isEmpty()) out.add(stripQuotes(t));
+        return out;
+    }
+
+    private static String stripQuotes(String s) {
+        if (s.length() >= 2 && (s.charAt(0) == '"' || s.charAt(0) == '\'')
+                && s.charAt(s.length() - 1) == s.charAt(0)) {
+            return s.substring(1, s.length() - 1);
+        }
+        return s;
+    }
+
+    private static String truncateSmart(String s, int max) {
+        if (s == null) return "";
+        if (s.length() <= max) return s;
+
+        int nl = s.lastIndexOf('\n', max);
+        if (nl > max / 2) {
+            return s.substring(0, nl) + "\n…";
+        }
+        int space = s.lastIndexOf(' ', max);
+        if (space > max / 2) {
+            return s.substring(0, space) + "…";
+        }
+        int urlBoundary = Math.max(
+                Math.max(s.lastIndexOf('/', max), s.lastIndexOf('?', max)),
+                Math.max(s.lastIndexOf('&', max), s.lastIndexOf('#', max))
+        );
+        if (urlBoundary > max / 2) {
+            return s.substring(0, urlBoundary) + "…";
+        }
+        return s.substring(0, max) + "…";
+    }
+
+    private static String escapeQuotes(String s) {
+        if (s == null) return "";
+        StringBuilder sb = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '"' -> sb.append("\\\"");
+                case '\\' -> sb.append("\\\\");
+                case '\n' -> sb.append("\\n");
+                case '\t' -> sb.append("\\t");
+                case '\r' -> sb.append("\\r");
+                default -> sb.append(c);
+            }
         }
         return sb.toString();
     }
 
-    /**
-     * Fallback для elementRole, если LLM не вернула поле.
-     */
     private String deriveRole(LocatorInfo info) {
         if (info.tag() == null) return null;
         return switch (info.tag()) {
@@ -349,14 +545,6 @@ public class UiExecutor {
         }
     }
 
-    /**
-     * Сохраняет HTML-снимок страницы рядом со скачанными кейсами.
-     * Отключено по умолчанию — включается через app.debug.dump-html=true
-     * или профиль debug / переменную окружения APP_DEBUG_DUMP_HTML=true.
-     * <p>
-     * Агент (LLM) эти файлы НЕ читает. Они нужны только человеку-автоматизатору
-     * для воспроизведения проблемного состояния. В проде должны быть выключены.
-     */
     public void dumpHtml(UiSession session, String testCaseId, int stepIndex) {
         if (!dumpHtmlEnabled) {
             return;
@@ -391,7 +579,7 @@ public class UiExecutor {
     }
 
     private record LocatorInfo(String locator, int count, String tag, String testidOrId,
-                               String role, String ariaLabel, String text, String type) {
+                               String cls, String role, String ariaLabel, String type, String text) {
     }
 
     public static final class UiSession implements AutoCloseable {
