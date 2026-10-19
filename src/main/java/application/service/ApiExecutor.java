@@ -1,6 +1,7 @@
 package application.service;
 
 import application.dto.Dtos.StepEnrichment;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.restassured.RestAssured;
 import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
@@ -14,6 +15,8 @@ import java.util.Map;
 @Slf4j
 @Service
 public class ApiExecutor {
+
+    private final ObjectMapper mapper = new ObjectMapper();
 
     public record ApiStepResult(StepEnrichment enrichment,
                                 String responseBody,
@@ -76,6 +79,24 @@ public class ApiExecutor {
             }
             StepEnrichment e = new StepEnrichment(stepIndex, "assertHeader",
                     "assertHeader → `" + name + "` содержит `" + expected + "`");
+            log.info("API-шаг {}: {}", stepIndex + 1, e.detail());
+            return new ApiStepResult(e, lastResponseBody, lastResponseHeaders);
+        }
+
+        // parseJson — проверка, что тело последнего ответа является валидным JSON
+        if ("parsejson".equals(op)) {
+            if (lastResponseBody == null || lastResponseBody.isBlank()) {
+                throw new UiExecutor.LocatorNotResolved(
+                        "parseJson: нет тела предыдущего ответа — сначала выполните apiCall");
+            }
+            try {
+                mapper.readTree(lastResponseBody);
+            } catch (Exception e) {
+                throw new UiExecutor.LocatorNotResolved(
+                        "parseJson: тело ответа не является валидным JSON: " + e.getMessage());
+            }
+            StepEnrichment e = new StepEnrichment(stepIndex, "parseJson",
+                    "parseJson → тело ответа успешно разобрано как JSON");
             log.info("API-шаг {}: {}", stepIndex + 1, e.detail());
             return new ApiStepResult(e, lastResponseBody, lastResponseHeaders);
         }
