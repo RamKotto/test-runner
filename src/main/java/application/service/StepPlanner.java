@@ -80,8 +80,8 @@ public class StepPlanner {
 
         if (uiHtmlSnapshot != null && !uiHtmlSnapshot.isBlank()) {
             user.append("HTML текущей страницы (обрезан):\n");
-            user.append(uiHtmlSnapshot.length() > 12000
-                    ? uiHtmlSnapshot.substring(0, 12000)
+            user.append(uiHtmlSnapshot.length() > 30000
+                    ? uiHtmlSnapshot.substring(0, 30000)
                     : uiHtmlSnapshot);
             user.append("\n");
         }

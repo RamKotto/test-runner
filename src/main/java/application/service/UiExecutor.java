@@ -81,9 +81,9 @@ public class UiExecutor {
 
     public String snapshotHtml(UiSession session) {
         try {
-            return session.page().content();
+            return session.page().evaluate("() => document.body ? document.body.innerText : ''").toString();
         } catch (Exception e) {
-            log.debug("Не удалось получить HTML: {}", e.getMessage());
+            log.debug("Не удалось получить текст: {}", e.getMessage());
             return "";
         }
     }
