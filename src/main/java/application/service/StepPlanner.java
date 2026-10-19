@@ -24,7 +24,8 @@ public class StepPlanner {
 
     public record Plan(
             String operation, String locator, String value, String method, String path,
-            String bodyJson, Integer expectedStatus, String topicKey, String question, String reason
+            String bodyJson, Integer expectedStatus, String topicKey, String question, String reason,
+            String locatorStrategy, String elementRole, String elementName, String locatorAlternatives
     ) {
         public boolean needsClarification() {
             return "needClarification".equalsIgnoreCase(operation);
@@ -33,9 +34,20 @@ public class StepPlanner {
         public boolean isSkip() {
             return "skip".equalsIgnoreCase(operation);
         }
+
+        public boolean isUiOperation() {
+            String op = operation == null ? "" : operation.toLowerCase();
+            return switch (op) {
+                case "navigate", "click", "fill", "asserttext", "waitfortext", "assertbody" -> true;
+                default -> false;
+            };
+        }
     }
 
-    public Plan planStep(ParsedTestCase tc, int stepIndex, String stepText, String uiTextSnapshot,
+    /**
+     * @param domSnapshot компактный DOM-снапшот интерактивных элементов (см. UiExecutor.snapshotForPlanning)
+     */
+    public Plan planStep(ParsedTestCase tc, int stepIndex, String stepText, String domSnapshot,
                          String apiBaseUrl, List<StepEnrichment> previousEnrichments,
                          String lastResponseBody, Map<String, String> lastResponseHeaders, Integer lastStatusCode) {
         StringBuilder user = new StringBuilder();
@@ -60,9 +72,9 @@ public class StepPlanner {
             user.append("\nДля проверки тела используй assertBody, заголовка — assertHeader, валидности JSON — parseJson, статуса — assertStatus.\n\n");
         }
 
-        if (uiTextSnapshot != null && !uiTextSnapshot.isBlank()) {
-            user.append("Видимый текст текущей страницы:\n");
-            user.append(uiTextSnapshot.length() > 30000 ? uiTextSnapshot.substring(0, 30000) : uiTextSnapshot).append("\n");
+        if (domSnapshot != null && !domSnapshot.isBlank()) {
+            user.append("DOM-СНАПШОТ страницы (только интерактивные элементы с атрибутами):\n");
+            user.append(domSnapshot.length() > 30000 ? domSnapshot.substring(0, 30000) : domSnapshot).append("\n");
         }
         if (apiBaseUrl != null && !apiBaseUrl.isBlank()) user.append("\nAPI base URL: ").append(apiBaseUrl);
 
@@ -87,7 +99,9 @@ public class StepPlanner {
                     str(map.get("operation")), str(map.get("locator")), str(map.get("value")),
                     str(map.get("method")), str(map.get("path")), str(map.get("bodyJson")),
                     map.get("expectedStatus") instanceof Number n ? n.intValue() : null,
-                    str(map.get("topicKey")), str(map.get("question")), str(map.get("reason"))
+                    str(map.get("topicKey")), str(map.get("question")), str(map.get("reason")),
+                    str(map.get("locatorStrategy")), str(map.get("elementRole")),
+                    str(map.get("elementName")), str(map.get("locatorAlternatives"))
             );
         } catch (Exception e) {
             throw new application.exception.GenerationException("Модель вернула невалидный JSON: " + e.getMessage(), e);

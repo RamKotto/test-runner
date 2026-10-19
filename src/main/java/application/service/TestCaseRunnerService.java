@@ -77,8 +77,8 @@ public class TestCaseRunnerService {
         try (UiExecutor.UiSession session = uiExecutor.newSession(startUrl)) {
             for (int i = 0; i < tc.steps().size(); i++) {
                 String step = tc.steps().get(i);
-                String text = uiExecutor.snapshotHtml(session);
-                StepPlanner.Plan plan = planner.planStep(tc, i, step, text, null, enrichments, null, null, null);
+                String dom = uiExecutor.snapshotForPlanning(session);
+                StepPlanner.Plan plan = planner.planStep(tc, i, step, dom, null, enrichments, null, null, null);
 
                 if (plan.isSkip()) return skipped(tc, enrichments, i, plan.reason());
                 if (plan.needsClarification()) {
@@ -89,6 +89,9 @@ public class TestCaseRunnerService {
                     Clarification c = new Clarification(tc.id(), i, withTopic(plan.question(), topicKey), plan.reason());
                     return new RunnerOutcome(new ExecutionOutcome(tc.id(), tc.sourceFilename(), "NEEDS_CLARIFICATION", "Прервано на шаге " + (i + 1), enrichments), List.of(c), false);
                 }
+
+                // Сохраняем HTML-снимок ДО действия — для воспроизводимости
+                uiExecutor.dumpHtml(session, tc.id(), i);
 
                 try {
                     enrichments.add(uiExecutor.executeStep(session, i, plan, uiExecutor.currentUrl(session)));

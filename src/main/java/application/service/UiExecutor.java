@@ -6,6 +6,9 @@ import com.microsoft.playwright.*;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
+
 @Slf4j
 @Service
 public class UiExecutor {
@@ -33,6 +36,74 @@ public class UiExecutor {
         return new UiSession(ctx, page);
     }
 
+    /**
+     * Компактный DOM-снапшот: только интерактивные и "якорные" элементы с атрибутами.
+     * Отдаётся в LLM вместо innerText — чтобы он мог выбрать реальный селектор.
+     */
+    public String snapshotForPlanning(UiSession session) {
+        try {
+            return (String) session.page().evaluate("""
+                        () => {
+                            const MAX = 600;
+                            const out = [];
+                            const seen = new Set();
+                            const interesting = new Set([
+                                'A','BUTTON','INPUT','SELECT','TEXTAREA','FORM','LABEL',
+                                'H1','H2','H3','H4','H5','H6','TABLE','TR','TD','TH',
+                                'PRE','CODE','NAV','MAIN','HEADER','FOOTER','SECTION','ARTICLE'
+                            ]);
+                            const walk = (el, depth) => {
+                                if (!el || el.nodeType !== 1) return;
+                                if (out.length >= MAX) return;
+                                const tag = el.tagName;
+                                const role = el.getAttribute('role');
+                                const testid = el.getAttribute('data-testid')
+                                             || el.getAttribute('data-test-id')
+                                             || el.getAttribute('data-test');
+                                const id = el.id;
+                                const cls = (el.className && typeof el.className === 'string')
+                                             ? el.className.trim() : '';
+                                const ariaLabel = el.getAttribute('aria-label');
+                                const name = el.getAttribute('name');
+                                const type = el.getAttribute('type');
+                                const href = tag === 'A' ? el.getAttribute('href') : null;
+                                const placeholder = el.getAttribute('placeholder');
+                                const isInteresting = interesting.has(tag)
+                                    || testid || id || role || ariaLabel
+                                    || (cls && /btn|button|link|input|card|nav|menu|modal|form|code|pre/i.test(cls));
+                                let text = '';
+                                if (isInteresting) {
+                                    text = (el.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 120);
+                                }
+                                const key = tag + '|' + (id||'') + '|' + (testid||'') + '|' + text;
+                                if (isInteresting && !seen.has(key)) {
+                                    seen.add(key);
+                                    const attrs = [];
+                                    if (id) attrs.push('#' + id);
+                                    if (testid) attrs.push('data-testid="' + testid + '"');
+                                    if (role) attrs.push('role="' + role + '"');
+                                    if (ariaLabel) attrs.push('aria-label="' + ariaLabel + '"');
+                                    if (name) attrs.push('name="' + name + '"');
+                                    if (type) attrs.push('type="' + type + '"');
+                                    if (href) attrs.push('href="' + href + '"');
+                                    if (placeholder) attrs.push('placeholder="' + placeholder + '"');
+                                    if (cls) attrs.push('class="' + cls.slice(0, 100) + '"');
+                                    out.push(' '.repeat(depth) + '<' + tag.toLowerCase()
+                                        + (attrs.length ? ' ' + attrs.join(' ') : '')
+                                        + '> ' + (text ? '"' + text + '"' : ''));
+                                }
+                                for (const c of el.children) walk(c, depth + (isInteresting ? 1 : 0));
+                            };
+                            if (document.body) walk(document.body, 0);
+                            return out.join('\\n');
+                        }
+                    """);
+        } catch (Exception e) {
+            log.debug("snapshotForPlanning failed: {}", e.getMessage());
+            return "";
+        }
+    }
+
     public StepEnrichment executeStep(UiSession session,
                                       int stepIndex,
                                       StepPlanner.Plan plan,
@@ -50,29 +121,38 @@ public class UiExecutor {
             case "click": {
                 String loc = requireLocator(plan);
                 assertLocatorExists(page, loc);
+                LocatorInfo info = inspectLocator(page, loc);
                 page.locator(loc).click();
-                return new StepEnrichment(stepIndex, "click", "click → `" + loc + "`");
+                String detail = buildLocatorDetail("click → `" + loc + "`", info, plan, null);
+                return new StepEnrichment(stepIndex, "click", detail);
             }
             case "fill": {
                 String loc = requireLocator(plan);
                 String value = plan.value();
                 if (value == null) throw new LocatorNotResolved("не указано значение для fill");
                 assertLocatorExists(page, loc);
+                LocatorInfo info = inspectLocator(page, loc);
                 page.locator(loc).fill(value);
-                return new StepEnrichment(stepIndex, "fill", "fill → `" + loc + "` = `" + value + "`");
+                String detail = buildLocatorDetail("fill → `" + loc + "` = `" + value + "`",
+                        info, plan, null);
+                return new StepEnrichment(stepIndex, "fill", detail);
             }
             case "assertText": {
                 String loc = requireLocator(plan);
                 String expected = plan.value();
                 if (expected == null) throw new LocatorNotResolved("не указан ожидаемый текст");
                 assertLocatorExists(page, loc);
+                LocatorInfo info = inspectLocator(page, loc);
                 String actual = page.locator(loc).innerText();
                 if (!actual.contains(expected)) {
                     throw new LocatorNotResolved(
                             "текст в `" + loc + "` = \"" + actual + "\" не содержит \"" + expected + "\"");
                 }
-                return new StepEnrichment(stepIndex, "assertText",
-                        "assertText → `" + loc + "` содержит `" + expected + "`");
+                String snippet = actual.length() > 160 ? actual.substring(0, 160) + "…" : actual;
+                String detail = buildLocatorDetail(
+                        "assertText → `" + loc + "` содержит `" + expected + "`",
+                        info, plan, snippet);
+                return new StepEnrichment(stepIndex, "assertText", detail);
             }
             case "waitForText": {
                 String expected = plan.value();
@@ -109,14 +189,96 @@ public class UiExecutor {
         }
     }
 
-    public String snapshotHtml(UiSession session) {
+    /**
+     * Проверка локатора и подтягивание реальных атрибутов.
+     */
+    private LocatorInfo inspectLocator(Page page, String locator) {
         try {
-            return session.page().evaluate(
-                    "() => document.body ? document.body.innerText : ''").toString();
+            Locator loc = page.locator(locator);
+            int count = loc.count();
+            if (count == 0) {
+                return new LocatorInfo(locator, 0, null, null, null, null, null);
+            }
+            Locator first = loc.first();
+            String tag = safeString(first.evaluate("e => e.tagName ? e.tagName.toLowerCase() : ''"));
+            String testid = safeAttr(first, "data-testid");
+            if (testid == null) testid = safeAttr(first, "data-test-id");
+            if (testid == null) testid = safeAttr(first, "data-test");
+            String id = safeAttr(first, "id");
+            String role = safeAttr(first, "role");
+            String aria = safeAttr(first, "aria-label");
+            String text = safeString(first.innerText());
+            if (text != null) {
+                text = text.trim().replaceAll("\\s+", " ");
+                if (text.length() > 80) text = text.substring(0, 80) + "…";
+            }
+            return new LocatorInfo(locator, count, tag, testid != null ? testid : id,
+                    role, aria, text);
         } catch (Exception e) {
-            log.debug("Не удалось получить текст: {}", e.getMessage());
-            return "";
+            log.debug("inspectLocator failed for `{}`: {}", locator, e.getMessage());
+            return new LocatorInfo(locator, -1, null, null, null, null, null);
         }
+    }
+
+    private String buildLocatorDetail(String header, LocatorInfo info, StepPlanner.Plan plan,
+                                      String snippet) {
+        StringBuilder sb = new StringBuilder(header);
+        if (info.count() >= 0) {
+            sb.append("\n   • matches: ").append(info.count());
+        } else {
+            sb.append("\n   • matches: unknown");
+        }
+        if (info.tag() != null) {
+            sb.append("\n   • element: <").append(info.tag());
+            if (info.testidOrId() != null) {
+                sb.append(info.testidOrId().matches("[a-zA-Z0-9_\\-]+")
+                        && plan.locatorStrategy() != null
+                        && plan.locatorStrategy().toLowerCase().contains("testid")
+                        ? " data-testid=\"" + info.testidOrId() + "\""
+                        : " id=\"" + info.testidOrId() + "\"");
+            }
+            if (info.role() != null) sb.append(" role=\"").append(info.role()).append("\"");
+            if (info.ariaLabel() != null) sb.append(" aria-label=\"").append(info.ariaLabel()).append("\"");
+            sb.append(">");
+        }
+        if (info.text() != null && !info.text().isBlank()) {
+            sb.append("\n   • text: \"").append(info.text()).append("\"");
+        }
+        if (snippet != null && !snippet.isBlank()) {
+            sb.append("\n   • snippet: \"").append(snippet.replace("\n", "\\n")).append("\"");
+        }
+        if (plan.locatorStrategy() != null && !plan.locatorStrategy().isBlank()) {
+            sb.append("\n   • strategy: ").append(plan.locatorStrategy());
+        }
+        if (plan.elementRole() != null && !plan.elementRole().isBlank()) {
+            sb.append("\n   • role: ").append(plan.elementRole());
+        }
+        if (plan.elementName() != null && !plan.elementName().isBlank()) {
+            sb.append("\n   • name: \"").append(plan.elementName()).append("\"");
+        }
+        if (plan.locatorAlternatives() != null && !plan.locatorAlternatives().isBlank()
+                && !"null".equalsIgnoreCase(plan.locatorAlternatives())) {
+            sb.append("\n   • alternatives: ").append(plan.locatorAlternatives());
+        }
+        if (info.count() > 1) {
+            sb.append("\n   • ⚠️ WARNING: локатор матчит ")
+                    .append(info.count())
+                    .append(" элементов — добавьте уточнение в локатор или обратитесь к разработчику");
+        }
+        return sb.toString();
+    }
+
+    private String safeAttr(Locator loc, String name) {
+        try {
+            String v = loc.getAttribute(name);
+            return (v == null || v.isBlank()) ? null : v;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private String safeString(Object o) {
+        return o == null ? null : o.toString();
     }
 
     public String currentUrl(UiSession session) {
@@ -124,6 +286,21 @@ public class UiExecutor {
             return session.page().url();
         } catch (Exception e) {
             return null;
+        }
+    }
+
+    /**
+     * Сохраняет HTML-снимок страницы рядом со скачанными кейсами.
+     */
+    public void dumpHtml(UiSession session, String testCaseId, int stepIndex) {
+        try {
+            Path dir = appProps.getDownload().getDirectory();
+            Files.createDirectories(dir);
+            Files.writeString(
+                    dir.resolve(testCaseId + ".step" + (stepIndex + 1) + ".html"),
+                    session.page().content());
+        } catch (Exception e) {
+            log.debug("dumpHtml failed: {}", e.getMessage());
         }
     }
 
@@ -143,6 +320,10 @@ public class UiExecutor {
         } catch (PlaywrightException e) {
             throw new LocatorNotResolved("некорректный локатор `" + locator + "`: " + e.getMessage());
         }
+    }
+
+    private record LocatorInfo(String locator, int count, String tag, String testidOrId,
+                               String role, String ariaLabel, String text) {
     }
 
     public static final class UiSession implements AutoCloseable {
