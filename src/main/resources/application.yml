@@ -85,7 +85,7 @@ openrouter:
   base-url: https://openrouter.ai/api/v1
   api-key:
   model: anthropic/claude-haiku-5.5
-  max-output-tokens: 32000
+  max-output-tokens: 64000
   timeout-seconds: 2400
   connect-timeout-seconds: 30
   referer: http://localhost:8083
