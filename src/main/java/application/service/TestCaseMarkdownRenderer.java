@@ -15,7 +15,7 @@ public class TestCaseMarkdownRenderer {
 
     /**
      * Обогащение пишется СТРОГО под шагом, к которому относится.
-     * Многострочный detail рендерится с префиксом "> " на каждой строке,
+     * Многострочный detail рендерится с префиксом "   > 🔍" на каждой строке,
      * чтобы markdown-блок оставался единым.
      */
     public String renderEnriched(ParsedTestCase tc, List<StepEnrichment> enrichments) {

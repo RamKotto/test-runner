@@ -2,6 +2,7 @@ package application.service;
 
 import application.config.AppProperties;
 import application.dto.Dtos.StepEnrichment;
+import application.exception.AssertionFailure;
 import com.microsoft.playwright.*;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -38,7 +39,7 @@ public class UiExecutor {
 
     /**
      * Компактный DOM-снапшот: только интерактивные и "якорные" элементы с атрибутами.
-     * Отдаётся в LLM вместо innerText — чтобы он мог выбрать реальный селектор.
+     * Отдаётся в LLM вместо innerText — чтобы модель могла выбрать реальный селектор.
      */
     public String snapshotForPlanning(UiSession session) {
         try {
@@ -133,8 +134,8 @@ public class UiExecutor {
                 assertLocatorExists(page, loc);
                 LocatorInfo info = inspectLocator(page, loc);
                 page.locator(loc).fill(value);
-                String detail = buildLocatorDetail("fill → `" + loc + "` = `" + value + "`",
-                        info, plan, null);
+                String detail = buildLocatorDetail(
+                        "fill → `" + loc + "` = `" + value + "`", info, plan, null);
                 return new StepEnrichment(stepIndex, "fill", detail);
             }
             case "assertText": {
@@ -145,8 +146,10 @@ public class UiExecutor {
                 LocatorInfo info = inspectLocator(page, loc);
                 String actual = page.locator(loc).innerText();
                 if (!actual.contains(expected)) {
-                    throw new LocatorNotResolved(
-                            "текст в `" + loc + "` = \"" + actual + "\" не содержит \"" + expected + "\"");
+                    // Текст на странице есть, но другой — это FAILED, не уточнение.
+                    throw new AssertionFailure(
+                            "текст в `" + loc + "` = \"" + truncate(actual, 200)
+                                    + "\" не содержит \"" + expected + "\"");
                 }
                 String snippet = actual.length() > 160 ? actual.substring(0, 160) + "…" : actual;
                 String detail = buildLocatorDetail(
@@ -165,7 +168,7 @@ public class UiExecutor {
                             expected,
                             new Page.WaitForFunctionOptions().setTimeout(10000));
                 } catch (PlaywrightException e) {
-                    throw new LocatorNotResolved(
+                    throw new AssertionFailure(
                             "текст `" + expected + "` не появился на странице за 10 секунд");
                 }
                 return new StepEnrichment(stepIndex, "waitForText",
@@ -178,8 +181,7 @@ public class UiExecutor {
                 }
                 String actual = page.locator("body").innerText();
                 if (!actual.contains(expected)) {
-                    throw new LocatorNotResolved(
-                            "текст в body не содержит `" + expected + "`");
+                    throw new AssertionFailure("текст в body не содержит `" + expected + "`");
                 }
                 return new StepEnrichment(stepIndex, "assertBody",
                         "assertBody → `body` содержит `" + expected + "`");
@@ -197,7 +199,7 @@ public class UiExecutor {
             Locator loc = page.locator(locator);
             int count = loc.count();
             if (count == 0) {
-                return new LocatorInfo(locator, 0, null, null, null, null, null);
+                return new LocatorInfo(locator, 0, null, null, null, null, null, null);
             }
             Locator first = loc.first();
             String tag = safeString(first.evaluate("e => e.tagName ? e.tagName.toLowerCase() : ''"));
@@ -207,38 +209,38 @@ public class UiExecutor {
             String id = safeAttr(first, "id");
             String role = safeAttr(first, "role");
             String aria = safeAttr(first, "aria-label");
+            String type = safeAttr(first, "type");
             String text = safeString(first.innerText());
             if (text != null) {
                 text = text.trim().replaceAll("\\s+", " ");
                 if (text.length() > 80) text = text.substring(0, 80) + "…";
             }
             return new LocatorInfo(locator, count, tag, testid != null ? testid : id,
-                    role, aria, text);
+                    role, aria, text, type);
         } catch (Exception e) {
             log.debug("inspectLocator failed for `{}`: {}", locator, e.getMessage());
-            return new LocatorInfo(locator, -1, null, null, null, null, null);
+            return new LocatorInfo(locator, -1, null, null, null, null, null, null);
         }
     }
 
     private String buildLocatorDetail(String header, LocatorInfo info, StepPlanner.Plan plan,
                                       String snippet) {
         StringBuilder sb = new StringBuilder(header);
-        if (info.count() >= 0) {
-            sb.append("\n   • matches: ").append(info.count());
-        } else {
-            sb.append("\n   • matches: unknown");
-        }
+        sb.append("\n   • matches: ").append(info.count() >= 0 ? info.count() : "unknown");
         if (info.tag() != null) {
             sb.append("\n   • element: <").append(info.tag());
             if (info.testidOrId() != null) {
-                sb.append(info.testidOrId().matches("[a-zA-Z0-9_\\-]+")
-                        && plan.locatorStrategy() != null
-                        && plan.locatorStrategy().toLowerCase().contains("testid")
-                        ? " data-testid=\"" + info.testidOrId() + "\""
-                        : " id=\"" + info.testidOrId() + "\"");
+                boolean isTestId = plan.locatorStrategy() != null
+                        && plan.locatorStrategy().toLowerCase().contains("testid");
+                if (isTestId) {
+                    sb.append(" data-testid=\"").append(info.testidOrId()).append("\"");
+                } else {
+                    sb.append(" id=\"").append(info.testidOrId()).append("\"");
+                }
             }
             if (info.role() != null) sb.append(" role=\"").append(info.role()).append("\"");
             if (info.ariaLabel() != null) sb.append(" aria-label=\"").append(info.ariaLabel()).append("\"");
+            if (info.type() != null) sb.append(" type=\"").append(info.type()).append("\"");
             sb.append(">");
         }
         if (info.text() != null && !info.text().isBlank()) {
@@ -250,12 +252,25 @@ public class UiExecutor {
         if (plan.locatorStrategy() != null && !plan.locatorStrategy().isBlank()) {
             sb.append("\n   • strategy: ").append(plan.locatorStrategy());
         }
-        if (plan.elementRole() != null && !plan.elementRole().isBlank()) {
-            sb.append("\n   • role: ").append(plan.elementRole());
+
+        // elementRole: из плана, иначе выводим из реального тега/type
+        String derivedRole = plan.elementRole();
+        if (derivedRole == null || derivedRole.isBlank()) {
+            derivedRole = deriveRole(info);
         }
-        if (plan.elementName() != null && !plan.elementName().isBlank()) {
-            sb.append("\n   • name: \"").append(plan.elementName()).append("\"");
+        if (derivedRole != null && !derivedRole.isBlank()) {
+            sb.append("\n   • role: ").append(derivedRole);
         }
+
+        // elementName: из плана, иначе берём видимый текст
+        String derivedName = plan.elementName();
+        if (derivedName == null || derivedName.isBlank()) {
+            derivedName = info.text();
+        }
+        if (derivedName != null && !derivedName.isBlank()) {
+            sb.append("\n   • name: \"").append(derivedName).append("\"");
+        }
+
         if (plan.locatorAlternatives() != null && !plan.locatorAlternatives().isBlank()
                 && !"null".equalsIgnoreCase(plan.locatorAlternatives())) {
             sb.append("\n   • alternatives: ").append(plan.locatorAlternatives());
@@ -266,6 +281,41 @@ public class UiExecutor {
                     .append(" элементов — добавьте уточнение в локатор или обратитесь к разработчику");
         }
         return sb.toString();
+    }
+
+    /**
+     * Fallback для elementRole, если LLM не вернула поле.
+     */
+    private String deriveRole(LocatorInfo info) {
+        if (info.tag() == null) return null;
+        return switch (info.tag()) {
+            case "button" -> "button";
+            case "a" -> "link";
+            case "input" -> {
+                String t = info.type() == null ? "" : info.type().toLowerCase();
+                yield switch (t) {
+                    case "submit", "button", "reset" -> "button";
+                    case "checkbox" -> "checkbox";
+                    case "radio" -> "radio";
+                    case "file" -> "file-upload";
+                    default -> "textbox";
+                };
+            }
+            case "textarea" -> "textbox";
+            case "select" -> "combobox";
+            case "h1", "h2", "h3", "h4", "h5", "h6" -> "heading";
+            case "pre", "code" -> "code";
+            case "img" -> "img";
+            case "nav" -> "navigation";
+            case "main" -> "main";
+            case "header" -> "banner";
+            case "footer" -> "contentinfo";
+            case "section", "article" -> "region";
+            case "table" -> "table";
+            case "tr" -> "row";
+            case "td", "th" -> "cell";
+            default -> null;
+        };
     }
 
     private String safeAttr(Locator loc, String name) {
@@ -279,6 +329,11 @@ public class UiExecutor {
 
     private String safeString(Object o) {
         return o == null ? null : o.toString();
+    }
+
+    private static String truncate(String s, int max) {
+        if (s == null) return "";
+        return s.length() <= max ? s : s.substring(0, max) + "…";
     }
 
     public String currentUrl(UiSession session) {
@@ -323,7 +378,7 @@ public class UiExecutor {
     }
 
     private record LocatorInfo(String locator, int count, String tag, String testidOrId,
-                               String role, String ariaLabel, String text) {
+                               String role, String ariaLabel, String text, String type) {
     }
 
     public static final class UiSession implements AutoCloseable {

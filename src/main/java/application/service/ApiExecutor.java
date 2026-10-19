@@ -1,6 +1,7 @@
 package application.service;
 
 import application.dto.Dtos.StepEnrichment;
+import application.exception.AssertionFailure;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.restassured.RestAssured;
 import io.restassured.response.Response;
@@ -8,6 +9,7 @@ import io.restassured.specification.RequestSpecification;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.io.IOException;
 import java.net.URI;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -44,9 +46,10 @@ public class ApiExecutor {
                 throw new UiExecutor.LocatorNotResolved("assertBody: нет тела предыдущего ответа");
             }
             if (!lastResponseBody.contains(expected)) {
-                throw new UiExecutor.LocatorNotResolved("assertBody: тело не содержит `" + expected + "`");
+                throw new AssertionFailure("assertBody: тело не содержит `" + expected + "`");
             }
-            StepEnrichment e = new StepEnrichment(stepIndex, "assertBody", "assertBody → тело содержит `" + expected + "`");
+            StepEnrichment e = new StepEnrichment(stepIndex, "assertBody",
+                    "assertBody → тело содержит `" + expected + "`");
             log.info("API-шаг {}: {}", stepIndex + 1, e.detail());
             return new ApiStepResult(e, lastResponseBody, lastResponseHeaders, lastStatusCode);
         }
@@ -62,12 +65,14 @@ public class ApiExecutor {
             }
             String actual = findHeaderIgnoreCase(lastResponseHeaders, name);
             if (actual == null) {
-                throw new UiExecutor.LocatorNotResolved("assertHeader: заголовок `" + name + "` отсутствует");
+                throw new AssertionFailure("assertHeader: заголовок `" + name + "` отсутствует");
             }
             if (!actual.toLowerCase().contains(expected.toLowerCase())) {
-                throw new UiExecutor.LocatorNotResolved("assertHeader: `" + name + "` = `" + actual + "`, ожидалось `" + expected + "`");
+                throw new AssertionFailure("assertHeader: `" + name + "` = `" + actual
+                        + "`, ожидалось `" + expected + "`");
             }
-            StepEnrichment e = new StepEnrichment(stepIndex, "assertHeader", "assertHeader → `" + name + "` содержит `" + expected + "`");
+            StepEnrichment e = new StepEnrichment(stepIndex, "assertHeader",
+                    "assertHeader → `" + name + "` содержит `" + expected + "`");
             log.info("API-шаг {}: {}", stepIndex + 1, e.detail());
             return new ApiStepResult(e, lastResponseBody, lastResponseHeaders, lastStatusCode);
         }
@@ -81,7 +86,7 @@ public class ApiExecutor {
                 throw new UiExecutor.LocatorNotResolved("assertStatus: нет статуса предыдущего ответа");
             }
 
-            boolean matched = false;
+            boolean matched;
             if (expected.endsWith("xx")) {
                 int prefix = Integer.parseInt(expected.substring(0, 1));
                 matched = (lastStatusCode / 100) == prefix;
@@ -90,9 +95,11 @@ public class ApiExecutor {
             }
 
             if (!matched) {
-                throw new UiExecutor.LocatorNotResolved("assertStatus: статус " + lastStatusCode + ", ожидалось " + expected);
+                throw new AssertionFailure("assertStatus: статус " + lastStatusCode
+                        + ", ожидалось " + expected);
             }
-            StepEnrichment e = new StepEnrichment(stepIndex, "assertStatus", "assertStatus → HTTP " + lastStatusCode + " соответствует `" + expected + "`");
+            StepEnrichment e = new StepEnrichment(stepIndex, "assertStatus",
+                    "assertStatus → HTTP " + lastStatusCode + " соответствует `" + expected + "`");
             log.info("API-шаг {}: {}", stepIndex + 1, e.detail());
             return new ApiStepResult(e, lastResponseBody, lastResponseHeaders, lastStatusCode);
         }
@@ -104,9 +111,10 @@ public class ApiExecutor {
             try {
                 mapper.readTree(lastResponseBody);
             } catch (Exception e) {
-                throw new UiExecutor.LocatorNotResolved("parseJson: невалидный JSON: " + e.getMessage());
+                throw new AssertionFailure("parseJson: невалидный JSON: " + e.getMessage());
             }
-            StepEnrichment e = new StepEnrichment(stepIndex, "parseJson", "parseJson → тело разобрано как JSON");
+            StepEnrichment e = new StepEnrichment(stepIndex, "parseJson",
+                    "parseJson → тело разобрано как JSON");
             log.info("API-шаг {}: {}", stepIndex + 1, e.detail());
             return new ApiStepResult(e, lastResponseBody, lastResponseHeaders, lastStatusCode);
         }
@@ -120,8 +128,14 @@ public class ApiExecutor {
             throw new UiExecutor.LocatorNotResolved("не указан apiBaseUrl и path");
         }
 
-        URI uri = URI.create(fullUrl);
-        String baseUri = uri.getScheme() + "://" + uri.getHost() + (uri.getPort() > 0 ? ":" + uri.getPort() : "");
+        URI uri;
+        try {
+            uri = URI.create(fullUrl);
+        } catch (IllegalArgumentException e) {
+            throw new UiExecutor.LocatorNotResolved("некорректный URL API: " + fullUrl);
+        }
+        String baseUri = uri.getScheme() + "://" + uri.getHost()
+                + (uri.getPort() > 0 ? ":" + uri.getPort() : "");
         String uriPath = uri.getRawPath();
         if (uriPath == null || uriPath.isEmpty()) uriPath = "/";
         if (uri.getRawQuery() != null) uriPath += "?" + uri.getRawQuery();
@@ -133,36 +147,91 @@ public class ApiExecutor {
             req.contentType("application/json").body(plan.bodyJson());
         }
 
-        Response response;
-        try {
-            response = switch (method) {
-                case "GET" -> req.get(uriPath);
-                case "POST" -> req.post(uriPath);
-                case "PUT" -> req.put(uriPath);
-                case "DELETE" -> req.delete(uriPath);
-                case "PATCH" -> req.patch(uriPath);
-                default -> throw new UiExecutor.LocatorNotResolved("неподдерживаемый HTTP-метод: " + method);
-            };
-        } catch (Exception e) {
-            throw new UiExecutor.LocatorNotResolved("ошибка вызова API: " + e.getMessage());
+        // Ретраим 5xx и сетевые ошибки только для идемпотентных методов
+        int attempts = ("GET".equals(method) || "HEAD".equals(method) || "OPTIONS".equals(method))
+                ? 3 : 1;
+        Response response = null;
+        Exception lastEx = null;
+
+        for (int attempt = 1; attempt <= attempts; attempt++) {
+            try {
+                response = switch (method) {
+                    case "GET" -> req.get(uriPath);
+                    case "POST" -> req.post(uriPath);
+                    case "PUT" -> req.put(uriPath);
+                    case "DELETE" -> req.delete(uriPath);
+                    case "PATCH" -> req.patch(uriPath);
+                    default -> throw new UiExecutor.LocatorNotResolved(
+                            "неподдерживаемый HTTP-метод: " + method);
+                };
+                int sc = response.statusCode();
+                if (sc < 500 || attempt == attempts) break;
+                log.warn("API-шаг {}: {} {} → HTTP {} (attempt {}/{}), повтор…",
+                        stepIndex + 1, method, fullUrl, sc, attempt, attempts);
+                sleepQuietly(500L * attempt);
+            } catch (Exception e) {
+                // RestAssured заворачивает сетевые ошибки, поэтому проверяем через instanceof
+                Throwable cause = e.getCause() != null ? e.getCause() : e;
+                if (e instanceof IOException || cause instanceof IOException) {
+                    lastEx = e;
+                    if (attempt == attempts) break;
+                    log.warn("API-шаг {}: {} {} → {} (attempt {}/{}), повтор…",
+                            stepIndex + 1, method, fullUrl, e.getMessage(), attempt, attempts);
+                    sleepQuietly(500L * attempt);
+                } else {
+                    if (e instanceof UiExecutor.LocatorNotResolved lr) throw lr;
+                    throw new AssertionFailure("ошибка вызова API: " + e.getMessage(), e);
+                }
+            }
+        }
+
+        if (response == null) {
+            throw new AssertionFailure("API " + method + " " + fullUrl
+                    + " не отвечает: " + (lastEx == null ? "unknown" : lastEx.getMessage()),
+                    lastEx);
         }
 
         int actual = response.statusCode();
         Integer expected = plan.expectedStatus();
         if (expected != null && actual != expected) {
-            throw new UiExecutor.LocatorNotResolved("API " + method + " " + fullUrl + " вернул " + actual + ", ожидалось " + expected);
+            if (actual >= 500 && actual <= 599) {
+                // Сервер недоступен — это FAILED, а не повод для уточнения.
+                throw new AssertionFailure("API " + method + " " + fullUrl + " вернул " + actual
+                        + " (сервер недоступен), ожидалось " + expected);
+            }
+            throw new AssertionFailure("API " + method + " " + fullUrl + " вернул " + actual
+                    + ", ожидалось " + expected);
         }
 
         String body = response.getBody() == null ? "" : response.getBody().asString();
         Map<String, String> responseHeaders = new LinkedHashMap<>();
-        response.getHeaders().asList().forEach(h -> responseHeaders.merge(h.getName(), h.getValue(), (a, b) -> a + ", " + b));
+        response.getHeaders().asList().forEach(h ->
+                responseHeaders.merge(h.getName(), h.getValue(), (a, b) -> a + ", " + b));
 
-        String detail = "apiCall → `" + method + " " + fullUrl + "` → HTTP " + actual;
+        String detail = buildApiCallDetail(method, fullUrl, actual, responseHeaders, body);
         log.info("API-шаг {}: {}", stepIndex + 1, detail);
-        return new ApiStepResult(new StepEnrichment(stepIndex, "apiCall", detail), body, responseHeaders, actual);
+        return new ApiStepResult(new StepEnrichment(stepIndex, "apiCall", detail),
+                body, responseHeaders, actual);
+    }
+
+    private String buildApiCallDetail(String method, String fullUrl, int status,
+                                      Map<String, String> responseHeaders, String body) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("apiCall → `").append(method).append(" ").append(fullUrl)
+                .append("` → HTTP ").append(status);
+        String ct = findHeaderIgnoreCase(responseHeaders, "content-type");
+        String cl = findHeaderIgnoreCase(responseHeaders, "content-length");
+        if (ct != null) sb.append("\n   • Content-Type: ").append(ct);
+        if (cl != null) sb.append("\n   • Content-Length: ").append(cl);
+        if (body != null && !body.isBlank()) {
+            String trimmed = body.length() > 200 ? body.substring(0, 200) + "…" : body;
+            sb.append("\n   • sample body: ").append(trimmed.replace("\n", "\\n"));
+        }
+        return sb.toString();
     }
 
     private String findHeaderIgnoreCase(Map<String, String> headers, String name) {
+        if (headers == null) return null;
         for (Map.Entry<String, String> e : headers.entrySet()) {
             if (e.getKey() != null && e.getKey().equalsIgnoreCase(name)) {
                 return e.getValue();
@@ -173,7 +242,8 @@ public class ApiExecutor {
 
     private String buildFullUrl(String apiBaseUrl, String path) {
         if (path != null && (path.startsWith("http://") || path.startsWith("https://"))) return path;
-        if ((path == null || path.isBlank()) && apiBaseUrl != null && (apiBaseUrl.startsWith("http://") || apiBaseUrl.startsWith("https://")))
+        if ((path == null || path.isBlank()) && apiBaseUrl != null
+                && (apiBaseUrl.startsWith("http://") || apiBaseUrl.startsWith("https://")))
             return apiBaseUrl;
         if (apiBaseUrl != null && path != null) {
             if (apiBaseUrl.endsWith("/") && path.startsWith("/"))
@@ -182,5 +252,13 @@ public class ApiExecutor {
             return apiBaseUrl + path;
         }
         return null;
+    }
+
+    private static void sleepQuietly(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 }

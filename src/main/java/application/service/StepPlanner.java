@@ -45,11 +45,13 @@ public class StepPlanner {
     }
 
     /**
-     * @param domSnapshot компактный DOM-снапшот интерактивных элементов (см. UiExecutor.snapshotForPlanning)
+     * @param domSnapshot компактный DOM-снапшот интерактивных элементов
+     *                    (см. UiExecutor.snapshotForPlanning)
      */
     public Plan planStep(ParsedTestCase tc, int stepIndex, String stepText, String domSnapshot,
                          String apiBaseUrl, List<StepEnrichment> previousEnrichments,
-                         String lastResponseBody, Map<String, String> lastResponseHeaders, Integer lastStatusCode) {
+                         String lastResponseBody, Map<String, String> lastResponseHeaders,
+                         Integer lastStatusCode) {
         StringBuilder user = new StringBuilder();
         user.append("Тип кейса: ").append(tc.type()).append("\n");
         user.append("Тест-кейс: ").append(tc.id()).append(" — ").append(tc.title()).append("\n");
@@ -59,7 +61,8 @@ public class StepPlanner {
         if (tc.answers() != null && !tc.answers().isEmpty()) {
             user.append("Ранее пользователь ответил на уточнения в этом кейсе:\n");
             for (AnswerRequest.Answer a : tc.answers()) {
-                user.append("- Вопрос: ").append(a.question()).append("\n  Ответ: ").append(a.answer()).append("\n");
+                user.append("- Вопрос: ").append(a.question())
+                        .append("\n  Ответ: ").append(a.answer()).append("\n");
             }
             user.append("\nИспользуй эти ответы. Если ответ равен SKIP — верни operation=\"skip\".\n\n");
         }
@@ -67,16 +70,22 @@ public class StepPlanner {
         if (previousEnrichments != null && !previousEnrichments.isEmpty()) {
             user.append("Уже выполненные шаги этого кейса:\n");
             for (StepEnrichment e : previousEnrichments) {
-                user.append("- Шаг ").append(e.stepIndex() + 1).append(": ").append(e.action()).append(" → ").append(e.detail()).append("\n");
+                user.append("- Шаг ").append(e.stepIndex() + 1)
+                        .append(": ").append(e.action()).append(" → ")
+                        .append(e.detail()).append("\n");
             }
-            user.append("\nДля проверки тела используй assertBody, заголовка — assertHeader, валидности JSON — parseJson, статуса — assertStatus.\n\n");
+            user.append("\nДля проверки тела используй assertBody, заголовка — assertHeader, ")
+                    .append("валидности JSON — parseJson, статуса — assertStatus.\n\n");
         }
 
         if (domSnapshot != null && !domSnapshot.isBlank()) {
             user.append("DOM-СНАПШОТ страницы (только интерактивные элементы с атрибутами):\n");
-            user.append(domSnapshot.length() > 30000 ? domSnapshot.substring(0, 30000) : domSnapshot).append("\n");
+            user.append(domSnapshot.length() > 30000 ? domSnapshot.substring(0, 30000) : domSnapshot)
+                    .append("\n");
         }
-        if (apiBaseUrl != null && !apiBaseUrl.isBlank()) user.append("\nAPI base URL: ").append(apiBaseUrl);
+        if (apiBaseUrl != null && !apiBaseUrl.isBlank()) {
+            user.append("\nAPI base URL: ").append(apiBaseUrl);
+        }
 
         if (lastStatusCode != null)
             user.append("\nHTTP статус последнего ответа: ").append(lastStatusCode).append("\n");
@@ -87,7 +96,10 @@ public class StepPlanner {
             }
         }
         if (lastResponseBody != null && !lastResponseBody.isBlank()) {
-            user.append("\nТело последнего ответа API:\n").append(lastResponseBody.length() > 8000 ? lastResponseBody.substring(0, 8000) : lastResponseBody).append("\n");
+            user.append("\nТело последнего ответа API:\n")
+                    .append(lastResponseBody.length() > 8000
+                            ? lastResponseBody.substring(0, 8000) : lastResponseBody)
+                    .append("\n");
         }
 
         String response = openRouter.complete(appProps.getPrompts().getPlanStep(), user.toString());
@@ -104,7 +116,8 @@ public class StepPlanner {
                     str(map.get("elementName")), str(map.get("locatorAlternatives"))
             );
         } catch (Exception e) {
-            throw new application.exception.GenerationException("Модель вернула невалидный JSON: " + e.getMessage(), e);
+            throw new application.exception.GenerationException(
+                    "Модель вернула невалидный JSON: " + e.getMessage(), e);
         }
     }
 

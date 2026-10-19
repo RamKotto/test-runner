@@ -1,6 +1,7 @@
 package application.service;
 
 import application.dto.Dtos.*;
+import application.exception.AssertionFailure;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -19,7 +20,9 @@ public class TestCaseRunnerService {
     private final UiExecutor uiExecutor;
     private final ApiExecutor apiExecutor;
 
-    public record RunnerOutcome(ExecutionOutcome outcome, List<Clarification> clarifications, boolean skipCase) {
+    public record RunnerOutcome(ExecutionOutcome outcome,
+                                List<Clarification> clarifications,
+                                boolean skipCase) {
     }
 
     public RunnerOutcome runCase(ParsedTestCase tc, String startUrl, String apiBaseUrl) {
@@ -72,42 +75,64 @@ public class TestCaseRunnerService {
 
     private RunnerOutcome runUiCase(ParsedTestCase tc, String startUrl) {
         List<StepEnrichment> enrichments = new ArrayList<>();
-        String failure = null;
 
         try (UiExecutor.UiSession session = uiExecutor.newSession(startUrl)) {
             for (int i = 0; i < tc.steps().size(); i++) {
                 String step = tc.steps().get(i);
                 String dom = uiExecutor.snapshotForPlanning(session);
-                StepPlanner.Plan plan = planner.planStep(tc, i, step, dom, null, enrichments, null, null, null);
+                StepPlanner.Plan plan = planner.planStep(
+                        tc, i, step, dom, null, enrichments, null, null, null);
 
                 if (plan.isSkip()) return skipped(tc, enrichments, i, plan.reason());
                 if (plan.needsClarification()) {
-                    String topicKey = normalizeTopic(plan.topicKey(), plan.question(), plan.reason());
+                    String topicKey = normalizeTopic(plan.topicKey(), plan.reason());
                     if (isSkippedInThisCase(tc, topicKey) || findAnswerInThisCase(tc, topicKey) != null) {
                         return skipped(tc, enrichments, i, "ответ по теме был, но шаг не выполнен");
                     }
-                    Clarification c = new Clarification(tc.id(), i, withTopic(plan.question(), topicKey), plan.reason());
-                    return new RunnerOutcome(new ExecutionOutcome(tc.id(), tc.sourceFilename(), "NEEDS_CLARIFICATION", "Прервано на шаге " + (i + 1), enrichments), List.of(c), false);
+                    Clarification c = new Clarification(tc.id(), i,
+                            withTopic(plan.question(), topicKey), plan.reason());
+                    return new RunnerOutcome(new ExecutionOutcome(
+                            tc.id(), tc.sourceFilename(),
+                            "NEEDS_CLARIFICATION", "Прервано на шаге " + (i + 1), enrichments),
+                            List.of(c), false);
                 }
 
-                // Сохраняем HTML-снимок ДО действия — для воспроизводимости
+                // HTML-снимок ДО действия — для воспроизводимости.
                 uiExecutor.dumpHtml(session, tc.id(), i);
 
                 try {
-                    enrichments.add(uiExecutor.executeStep(session, i, plan, uiExecutor.currentUrl(session)));
+                    enrichments.add(uiExecutor.executeStep(
+                            session, i, plan, uiExecutor.currentUrl(session)));
+                } catch (AssertionFailure ex) {
+                    // Тест не прошёл, но данных хватило — это FAILED, не уточнение.
+                    return new RunnerOutcome(new ExecutionOutcome(
+                            tc.id(), tc.sourceFilename(), "FAILED",
+                            "Шаг " + (i + 1) + ": " + ex.getMessage(), enrichments),
+                            List.of(), false);
                 } catch (UiExecutor.LocatorNotResolved ex) {
-                    String topicKey = normalizeTopic(plan.topicKey(), null, ex.getMessage());
+                    String topicKey = normalizeTopic(plan.topicKey(), ex.getMessage());
                     if (isSkippedInThisCase(tc, topicKey) || findAnswerInThisCase(tc, topicKey) != null) {
                         return skipped(tc, enrichments, i, ex.getMessage());
                     }
-                    Clarification c = new Clarification(tc.id(), i, withTopic("Шаг " + (i + 1) + " («" + step + "»): " + ex.getMessage(), topicKey), "Ошибка UI");
-                    return new RunnerOutcome(new ExecutionOutcome(tc.id(), tc.sourceFilename(), "NEEDS_CLARIFICATION", "Прервано на шаге " + (i + 1), enrichments), List.of(c), false);
+                    Clarification c = new Clarification(tc.id(), i,
+                            withTopic("Шаг " + (i + 1) + " («" + step + "»): " + ex.getMessage(), topicKey),
+                            "Ошибка планирования UI");
+                    return new RunnerOutcome(new ExecutionOutcome(
+                            tc.id(), tc.sourceFilename(),
+                            "NEEDS_CLARIFICATION", "Прервано на шаге " + (i + 1), enrichments),
+                            List.of(c), false);
                 }
             }
+            return new RunnerOutcome(new ExecutionOutcome(
+                    tc.id(), tc.sourceFilename(), "PASSED", null, enrichments),
+                    List.of(), false);
         } catch (Exception e) {
-            failure = e.getMessage();
+            log.error("UI-кейс {} упал с необработанной ошибкой", tc.id(), e);
+            return new RunnerOutcome(new ExecutionOutcome(
+                    tc.id(), tc.sourceFilename(), "FAILED",
+                    "Необработанная ошибка UI: " + e.getMessage(), enrichments),
+                    List.of(), false);
         }
-        return new RunnerOutcome(new ExecutionOutcome(tc.id(), tc.sourceFilename(), failure == null ? "PASSED" : "FAILED", failure, enrichments), List.of(), false);
     }
 
     private RunnerOutcome runApiCase(ParsedTestCase tc, String apiBaseUrl) {
@@ -118,47 +143,82 @@ public class TestCaseRunnerService {
 
         for (int i = 0; i < tc.steps().size(); i++) {
             String step = tc.steps().get(i);
-            StepPlanner.Plan plan = planner.planStep(tc, i, step, null, apiBaseUrl, enrichments, lastBody, lastHeaders, lastStatus);
+            StepPlanner.Plan plan = planner.planStep(
+                    tc, i, step, null, apiBaseUrl, enrichments, lastBody, lastHeaders, lastStatus);
 
             if (plan.isSkip()) return skipped(tc, enrichments, i, plan.reason());
             if (plan.needsClarification()) {
-                String topicKey = normalizeTopic(plan.topicKey(), plan.question(), plan.reason());
+                String topicKey = normalizeTopic(plan.topicKey(), plan.reason());
                 if (isSkippedInThisCase(tc, topicKey) || findAnswerInThisCase(tc, topicKey) != null) {
                     return skipped(tc, enrichments, i, "ответ по теме был, но шаг не выполнен");
                 }
-                Clarification c = new Clarification(tc.id(), i, withTopic(plan.question(), topicKey), plan.reason());
-                return new RunnerOutcome(new ExecutionOutcome(tc.id(), tc.sourceFilename(), "NEEDS_CLARIFICATION", "Прервано на шаге " + (i + 1), enrichments), List.of(c), false);
+                Clarification c = new Clarification(tc.id(), i,
+                        withTopic(plan.question(), topicKey), plan.reason());
+                return new RunnerOutcome(new ExecutionOutcome(
+                        tc.id(), tc.sourceFilename(),
+                        "NEEDS_CLARIFICATION", "Прервано на шаге " + (i + 1), enrichments),
+                        List.of(c), false);
             }
 
             try {
-                ApiExecutor.ApiStepResult result = apiExecutor.executeStep(i, plan, apiBaseUrl, Map.of(), Map.of(), lastBody, lastHeaders, lastStatus);
+                ApiExecutor.ApiStepResult result = apiExecutor.executeStep(
+                        i, plan, apiBaseUrl, Map.of(), Map.of(), lastBody, lastHeaders, lastStatus);
                 enrichments.add(result.enrichment());
                 if (result.responseBody() != null) lastBody = result.responseBody();
                 if (result.responseHeaders() != null && !result.responseHeaders().isEmpty())
                     lastHeaders = result.responseHeaders();
                 if (result.responseStatusCode() != null) lastStatus = result.responseStatusCode();
+            } catch (AssertionFailure ex) {
+                // Сравнение фактического результата с ожиданием — это FAILED.
+                return new RunnerOutcome(new ExecutionOutcome(
+                        tc.id(), tc.sourceFilename(), "FAILED",
+                        "Шаг " + (i + 1) + ": " + ex.getMessage(), enrichments),
+                        List.of(), false);
             } catch (UiExecutor.LocatorNotResolved ex) {
-                String topicKey = normalizeTopic(plan.topicKey(), null, ex.getMessage());
+                // Не смогли построить/выполнить запрос — нужен ответ пользователя.
+                String topicKey = normalizeTopic(plan.topicKey(), ex.getMessage());
                 if (isSkippedInThisCase(tc, topicKey) || findAnswerInThisCase(tc, topicKey) != null) {
                     return skipped(tc, enrichments, i, ex.getMessage());
                 }
-                Clarification c = new Clarification(tc.id(), i, withTopic("Шаг " + (i + 1) + " («" + step + "»): " + ex.getMessage(), topicKey), "Ошибка API");
-                return new RunnerOutcome(new ExecutionOutcome(tc.id(), tc.sourceFilename(), "NEEDS_CLARIFICATION", "Прервано на шаге " + (i + 1), enrichments), List.of(c), false);
+                Clarification c = new Clarification(tc.id(), i,
+                        withTopic("Шаг " + (i + 1) + " («" + step + "»): " + ex.getMessage(), topicKey),
+                        "Ошибка планирования API");
+                return new RunnerOutcome(new ExecutionOutcome(
+                        tc.id(), tc.sourceFilename(),
+                        "NEEDS_CLARIFICATION", "Прервано на шаге " + (i + 1), enrichments),
+                        List.of(c), false);
             }
         }
-        return new RunnerOutcome(new ExecutionOutcome(tc.id(), tc.sourceFilename(), "PASSED", null, enrichments), List.of(), false);
+        return new RunnerOutcome(new ExecutionOutcome(
+                tc.id(), tc.sourceFilename(), "PASSED", null, enrichments),
+                List.of(), false);
     }
 
-    private RunnerOutcome skipped(ParsedTestCase tc, List<StepEnrichment> enrichments, int stepIndex, String reason) {
-        String msg = "Пропущено по запросу пользователя (SKIP)" + (reason == null ? "" : ": " + reason);
-        return new RunnerOutcome(new ExecutionOutcome(tc.id(), tc.sourceFilename(), "SKIPPED", msg, enrichments), List.of(), false);
+    private RunnerOutcome skipped(ParsedTestCase tc, List<StepEnrichment> enrichments,
+                                  int stepIndex, String reason) {
+        String msg = "Пропущено по запросу пользователя (SKIP)"
+                + (reason == null ? "" : ": " + reason);
+        return new RunnerOutcome(new ExecutionOutcome(
+                tc.id(), tc.sourceFilename(), "SKIPPED", msg, enrichments),
+                List.of(), false);
     }
 
-    private String normalizeTopic(String topicKey, String question, String reason) {
-        String base = topicKey != null ? topicKey : (question != null ? question : reason);
-        if (base == null) base = "unknown";
-        String normalized = base.trim().toLowerCase().replaceAll("\\s+", " ");
-        return normalized.length() > 40 ? normalized.substring(0, 40) : normalized;
+    /**
+     * Стабильный ключ темы уточнения.
+     * Приоритет: topicKey от LLM → reason → "clarification".
+     * Никогда не содержит URL/текста ошибки — только нормализованные слова,
+     * чтобы ответы пользователя можно было переиспользовать между итерациями.
+     */
+    private String normalizeTopic(String topicKey, String reason) {
+        if (topicKey != null && !topicKey.isBlank()) {
+            String t = topicKey.trim().toLowerCase().replaceAll("[^a-z0-9_]+", "_");
+            return t.length() > 40 ? t.substring(0, 40) : t;
+        }
+        String base = (reason != null && !reason.isBlank())
+                ? reason.toLowerCase().replaceAll("[^a-z0-9]+", "_")
+                : "clarification";
+        if (base.isBlank()) base = "clarification";
+        return base.length() > 40 ? base.substring(0, 40) : base;
     }
 
     private String withTopic(String question, String topicKey) {
@@ -172,7 +232,9 @@ public class TestCaseRunnerService {
         if (t.equals("API")) return true;
         if (t.equals("NEGATIVE")) {
             String all = String.join(" ", tc.steps()).toLowerCase();
-            return all.contains("get-запрос") || all.contains("post-запрос") || all.contains("http://") || all.contains("https://") || all.contains("http-код") || all.contains("api.");
+            return all.contains("get-запрос") || all.contains("post-запрос")
+                    || all.contains("http://") || all.contains("https://")
+                    || all.contains("http-код") || all.contains("api.");
         }
         return false;
     }
