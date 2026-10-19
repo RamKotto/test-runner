@@ -74,6 +74,36 @@ public class UiExecutor {
                 return new StepEnrichment(stepIndex, "assertText",
                         "assertText → `" + loc + "` содержит `" + expected + "`");
             }
+            case "waitForText": {
+                String expected = plan.value();
+                if (expected == null || expected.isBlank()) {
+                    throw new LocatorNotResolved("не указан текст для waitForText");
+                }
+                try {
+                    page.waitForFunction(
+                            "t => document.documentElement && document.documentElement.innerText.includes(t)",
+                            expected,
+                            new Page.WaitForFunctionOptions().setTimeout(10000));
+                } catch (PlaywrightException e) {
+                    throw new LocatorNotResolved(
+                            "текст `" + expected + "` не появился на странице за 10 секунд");
+                }
+                return new StepEnrichment(stepIndex, "waitForText",
+                        "waitForText → `body` содержит `" + expected + "`");
+            }
+            case "assertBody": {
+                String expected = plan.value();
+                if (expected == null || expected.isBlank()) {
+                    throw new LocatorNotResolved("не указан ожидаемый текст для assertBody");
+                }
+                String actual = page.locator("body").innerText();
+                if (!actual.contains(expected)) {
+                    throw new LocatorNotResolved(
+                            "текст в body не содержит `" + expected + "`");
+                }
+                return new StepEnrichment(stepIndex, "assertBody",
+                        "assertBody → `body` содержит `" + expected + "`");
+            }
             default:
                 throw new LocatorNotResolved("неподдерживаемая UI-операция: " + plan.operation());
         }
@@ -81,7 +111,8 @@ public class UiExecutor {
 
     public String snapshotHtml(UiSession session) {
         try {
-            return session.page().evaluate("() => document.body ? document.body.innerText : ''").toString();
+            return session.page().evaluate(
+                    "() => document.body ? document.body.innerText : ''").toString();
         } catch (Exception e) {
             log.debug("Не удалось получить текст: {}", e.getMessage());
             return "";

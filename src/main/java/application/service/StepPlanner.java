@@ -46,7 +46,7 @@ public class StepPlanner {
     public Plan planStep(ParsedTestCase tc,
                          int stepIndex,
                          String stepText,
-                         String uiHtmlSnapshot,
+                         String uiTextSnapshot,
                          String apiBaseUrl,
                          List<StepEnrichment> previousEnrichments,
                          String lastResponseBody) {
@@ -56,7 +56,6 @@ public class StepPlanner {
         user.append("Ожидаемый результат всего кейса: ").append(tc.expectedResult()).append("\n\n");
         user.append("Шаг #").append(stepIndex + 1).append(": ").append(stepText).append("\n\n");
 
-        // Ответы пользователя (накопленные в этом кейсе)
         if (tc.answers() != null && !tc.answers().isEmpty()) {
             user.append("Ранее пользователь ответил на уточнения в этом кейсе:\n");
             for (AnswerRequest.Answer a : tc.answers()) {
@@ -67,7 +66,6 @@ public class StepPlanner {
             user.append("Если ответ равен SKIP — верни operation=\"skip\".\n\n");
         }
 
-        // Уже выполненные шаги этого кейса
         if (previousEnrichments != null && !previousEnrichments.isEmpty()) {
             user.append("Уже выполненные шаги этого кейса:\n");
             for (StepEnrichment e : previousEnrichments) {
@@ -75,14 +73,15 @@ public class StepPlanner {
                         .append(e.action()).append(" → ").append(e.detail()).append("\n");
             }
             user.append("\nУчитывай это: если нужный API-запрос уже выполнен — используй его результат, ");
-            user.append("не повторяй запрос. Для проверки тела используй operation=\"assertBody\".\n\n");
+            user.append("не повторяй запрос. Для проверки тела используй operation=\"assertBody\", ");
+            user.append("для проверки заголовка — operation=\"assertHeader\".\n\n");
         }
 
-        if (uiHtmlSnapshot != null && !uiHtmlSnapshot.isBlank()) {
-            user.append("HTML текущей страницы (обрезан):\n");
-            user.append(uiHtmlSnapshot.length() > 30000
-                    ? uiHtmlSnapshot.substring(0, 30000)
-                    : uiHtmlSnapshot);
+        if (uiTextSnapshot != null && !uiTextSnapshot.isBlank()) {
+            user.append("Видимый текст текущей страницы (обрезан):\n");
+            user.append(uiTextSnapshot.length() > 30000
+                    ? uiTextSnapshot.substring(0, 30000)
+                    : uiTextSnapshot);
             user.append("\n");
         }
         if (apiBaseUrl != null && !apiBaseUrl.isBlank()) {

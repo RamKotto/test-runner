@@ -30,15 +30,15 @@ app:
       - тип кейса (UI или API);
       - ответы пользователя на ранее заданные уточнения (если есть);
       - уже выполненные шаги этого же кейса с их enrichments (для API-кейсов);
-      - контекст: для UI — фрагмент HTML текущей страницы; для API — базовый URL и тело последнего ответа.
+      - контекст: для UI — видимый текст текущей страницы; для API — базовый URL и тело последнего ответа.
 
       Твоя задача — преобразовать шаг в ОДНУ конкретную операцию.
       Ответ — ТОЛЬКО валидный JSON, без markdown-обёрток.
 
       Формат ответа:
-      {"operation": "navigate|click|fill|assertText|waitForText|apiCall|assertBody|skip|needClarification",
-       "locator": "CSS-селектор (для UI)",
-       "value": "значение для fill/assertText/waitForText/assertBody/navigate",
+      {"operation": "navigate|click|fill|assertText|waitForText|apiCall|assertBody|assertHeader|parseJson|skip|needClarification",
+       "locator": "CSS-селектор (для UI) или имя заголовка (для assertHeader)",
+       "value": "значение для fill/assertText/waitForText/assertBody/assertHeader/navigate",
        "method": "GET|POST|PUT|DELETE|PATCH (для apiCall)",
        "path": "/path или полный URL (для apiCall)",
        "bodyJson": "{}",
@@ -52,8 +52,9 @@ app:
          Если ответ снимает неопределённость шага — НЕ ЗАПРАШИВАЙ уточнение повторно.
       2. Не выдумывай бизнес-логику и данные. Если шаг требует конкретное значение,
          которого нет ни в тексте шага, ни в ответах пользователя — верни needClarification.
-      3. UI: используй ТОЛЬКО элементы, реально присутствующие в HTML.
-         Если подходящего элемента нет — needClarification.
+      3. UI: используй ТОЛЬКО элементы, реально присутствующие в переданном тексте страницы.
+         Если подходящего элемента нет — needClarification. Для проверки наличия текста
+         на странице используй assertText с locator body или waitForText, но не assertBody.
       4. API: если пользователь дал полный URL — верни его в поле path,
          иначе path="/...". Метод по умолчанию GET.
       5. Для шага «открыть страницу» используй operation="navigate",
@@ -63,19 +64,28 @@ app:
       7. Если предыдущие шаги этого кейса уже выполнили apiCall с HTTP 200 на нужный URL,
          а текущий шаг требует проверить наличие поля в теле ответа — верни operation="assertBody",
          value=<имя поля или подстрока>. Не возвращай apiCall повторно и не требуй method/path.
+         operation="assertBody" доступна ТОЛЬКО для API-кейсов. Для UI-кейсов
+         используйте assertText или waitForText.
       8. Если среди ответов пользователя уже есть ответ SKIP на вопрос с той же темой
          (тот же topicKey или совпадающий reason) — верни operation="skip",
          reason="пользователь запросил пропуск".
       9. Поле topicKey обязательно для needClarification. Это короткий ключ темы
          (до 40 символов), например: api_base_url, ui_locator_block, coordinates.
          Для одного и того же topicKey задавай уточнение только один раз в рамках кейса.
-      10. Никаких дополнительных полей.
+      10. Для проверки HTTP-заголовка последнего ответа используй operation="assertHeader".
+          locator = имя заголовка (например Content-Type), value = ожидаемое значение
+          (например application/json). Новый apiCall не выполняй — заголовки уже сохранены.
+      11. Если шаг требует проверить, что тело ответа является валидным JSON —
+          используй operation="parseJson" без value. Операция разбирает тело
+          последнего ответа стандартным JSON-парсером и падает, если JSON невалиден.
+          Новый apiCall не выполняй.
+      12. Никаких дополнительных полей.
 
 openrouter:
   base-url: https://openrouter.ai/api/v1
   api-key:
   model: anthropic/claude-haiku-5.5
-  max-output-tokens: 24000
+  max-output-tokens: 32000
   timeout-seconds: 2400
   connect-timeout-seconds: 30
   referer: http://localhost:8083

@@ -8,16 +8,16 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.net.URI;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 @Slf4j
 @Service
 public class ApiExecutor {
 
-    /**
-     * Результат выполнения API-шага: enrichment + тело последнего ответа.
-     */
-    public record ApiStepResult(StepEnrichment enrichment, String responseBody) {
+    public record ApiStepResult(StepEnrichment enrichment,
+                                String responseBody,
+                                Map<String, String> responseHeaders) {
     }
 
     public ApiStepResult executeStep(int stepIndex,
@@ -25,7 +25,8 @@ public class ApiExecutor {
                                      String apiBaseUrl,
                                      Map<String, String> headers,
                                      Map<String, String> pathParams,
-                                     String lastResponseBody) {
+                                     String lastResponseBody,
+                                     Map<String, String> lastResponseHeaders) {
 
         String op = plan.operation() == null ? "" : plan.operation().toLowerCase();
 
@@ -46,7 +47,37 @@ public class ApiExecutor {
             StepEnrichment e = new StepEnrichment(stepIndex, "assertBody",
                     "assertBody → тело ответа содержит `" + expected + "`");
             log.info("API-шаг {}: {}", stepIndex + 1, e.detail());
-            return new ApiStepResult(e, lastResponseBody);
+            return new ApiStepResult(e, lastResponseBody, lastResponseHeaders);
+        }
+
+        // assertHeader — проверка заголовка последнего ответа
+        if ("assertheader".equals(op)) {
+            String name = plan.locator();
+            String expected = plan.value();
+            if (name == null || name.isBlank()) {
+                throw new UiExecutor.LocatorNotResolved("assertHeader: не указано имя заголовка");
+            }
+            if (expected == null || expected.isBlank()) {
+                throw new UiExecutor.LocatorNotResolved("assertHeader: не указано ожидаемое значение");
+            }
+            if (lastResponseHeaders == null || lastResponseHeaders.isEmpty()) {
+                throw new UiExecutor.LocatorNotResolved(
+                        "assertHeader: нет заголовков предыдущего ответа — сначала выполните apiCall");
+            }
+            String actual = findHeaderIgnoreCase(lastResponseHeaders, name);
+            if (actual == null) {
+                throw new UiExecutor.LocatorNotResolved(
+                        "assertHeader: заголовок `" + name + "` отсутствует в ответе");
+            }
+            if (!actual.toLowerCase().contains(expected.toLowerCase())) {
+                throw new UiExecutor.LocatorNotResolved(
+                        "assertHeader: `" + name + "` = `" + actual
+                                + "`, ожидалось вхождение `" + expected + "`");
+            }
+            StepEnrichment e = new StepEnrichment(stepIndex, "assertHeader",
+                    "assertHeader → `" + name + "` содержит `" + expected + "`");
+            log.info("API-шаг {}: {}", stepIndex + 1, e.detail());
+            return new ApiStepResult(e, lastResponseBody, lastResponseHeaders);
         }
 
         // apiCall — отправка запроса
@@ -100,9 +131,25 @@ public class ApiExecutor {
         }
 
         String body = response.getBody() == null ? "" : response.getBody().asString();
+        Map<String, String> responseHeaders = new LinkedHashMap<>();
+        response.getHeaders().asList().forEach(h ->
+                responseHeaders.merge(h.getName(), h.getValue(), (a, b) -> a + ", " + b));
+
         String detail = "apiCall → `" + method + " " + fullUrl + "` → HTTP " + actual;
         log.info("API-шаг {}: {}", stepIndex + 1, detail);
-        return new ApiStepResult(new StepEnrichment(stepIndex, "apiCall", detail), body);
+        return new ApiStepResult(
+                new StepEnrichment(stepIndex, "apiCall", detail),
+                body,
+                responseHeaders);
+    }
+
+    private String findHeaderIgnoreCase(Map<String, String> headers, String name) {
+        for (Map.Entry<String, String> e : headers.entrySet()) {
+            if (e.getKey() != null && e.getKey().equalsIgnoreCase(name)) {
+                return e.getValue();
+            }
+        }
+        return null;
     }
 
     private String buildFullUrl(String apiBaseUrl, String path) {

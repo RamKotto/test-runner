@@ -6,6 +6,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -59,10 +60,6 @@ public class TestCaseRunnerService {
         return fallback;
     }
 
-    /**
-     * Возвращает true, если по теме в рамках этого кейса уже был ответ SKIP.
-     * Ответы других кейсов не учитываются.
-     */
     private boolean isSkippedInThisCase(ParsedTestCase tc, String topicKey) {
         if (topicKey == null || topicKey.isBlank() || tc.answers() == null) return false;
         String needle = topicKey.trim().toLowerCase();
@@ -76,24 +73,6 @@ public class TestCaseRunnerService {
         return false;
     }
 
-    /**
-     * Возвращает true, если по теме в рамках этого кейса уже задавался вопрос
-     * (неважно, с каким ответом). Ответы других кейсов не учитываются.
-     */
-    private boolean wasAskedInThisCase(ParsedTestCase tc, String topicKey) {
-        if (topicKey == null || topicKey.isBlank() || tc.answers() == null) return false;
-        String needle = topicKey.trim().toLowerCase();
-        for (AnswerRequest.Answer a : tc.answers()) {
-            String q = a.question() == null ? "" : a.question().toLowerCase();
-            if (q.contains(needle)) return true;
-        }
-        return false;
-    }
-
-    /**
-     * Возвращает сохранённый ответ по теме в рамках этого кейса (если был).
-     * Ответы других кейсов не учитываются.
-     */
     private String findAnswerInThisCase(ParsedTestCase tc, String topicKey) {
         if (topicKey == null || topicKey.isBlank() || tc.answers() == null) return null;
         String needle = topicKey.trim().toLowerCase();
@@ -113,8 +92,8 @@ public class TestCaseRunnerService {
         try (UiExecutor.UiSession session = uiExecutor.newSession(startUrl)) {
             for (int i = 0; i < tc.steps().size(); i++) {
                 String step = tc.steps().get(i);
-                String html = uiExecutor.snapshotHtml(session);
-                StepPlanner.Plan plan = planner.planStep(tc, i, step, html, null,
+                String text = uiExecutor.snapshotHtml(session);
+                StepPlanner.Plan plan = planner.planStep(tc, i, step, text, null,
                         enrichments, null);
 
                 if (plan.isSkip()) {
@@ -125,21 +104,16 @@ public class TestCaseRunnerService {
                 if (plan.needsClarification()) {
                     String topicKey = normalizeTopic(plan.topicKey(), plan.question(), plan.reason());
 
-                    // SKIP по этой теме в этом кейсе → пропуск
                     if (isSkippedInThisCase(tc, topicKey)) {
                         log.info("{} шаг {}: тема {} — SKIP уже был в этом кейсе, пропуск",
                                 tc.id(), i + 1, topicKey);
                         return skipped(tc, enrichments, i, plan.reason());
                     }
 
-                    // Вопрос по теме уже задавался в этом кейсе → используем ответ, не спрашиваем
                     String existing = findAnswerInThisCase(tc, topicKey);
                     if (existing != null && !existing.isBlank()) {
-                        log.info("{} шаг {}: тема {} — ответ уже есть в этом кейсе, используем: {}",
-                                tc.id(), i + 1, topicKey, existing);
-                        // Ответ уже был передан в промпт при планировании.
-                        // Если модель всё равно вернула needClarification — значит,
-                        // ответ не помог. Пропускаем кейс, чтобы не зациклиться.
+                        log.info("{} шаг {}: тема {} — ответ уже есть, но шаг не выполнен, пропуск",
+                                tc.id(), i + 1, topicKey);
                         return skipped(tc, enrichments, i,
                                 "ответ по теме был, но шаг всё равно не выполнен");
                     }
@@ -206,6 +180,7 @@ public class TestCaseRunnerService {
     private RunnerOutcome runApiCase(ParsedTestCase tc, String apiBaseUrl) {
         List<StepEnrichment> enrichments = new ArrayList<>();
         String lastBody = null;
+        Map<String, String> lastHeaders = new LinkedHashMap<>();
 
         for (int i = 0; i < tc.steps().size(); i++) {
             String step = tc.steps().get(i);
@@ -249,10 +224,13 @@ public class TestCaseRunnerService {
 
             try {
                 ApiExecutor.ApiStepResult result = apiExecutor.executeStep(
-                        i, plan, apiBaseUrl, Map.of(), Map.of(), lastBody);
+                        i, plan, apiBaseUrl, Map.of(), Map.of(), lastBody, lastHeaders);
                 enrichments.add(result.enrichment());
                 if (result.responseBody() != null) {
                     lastBody = result.responseBody();
+                }
+                if (result.responseHeaders() != null && !result.responseHeaders().isEmpty()) {
+                    lastHeaders = result.responseHeaders();
                 }
             } catch (UiExecutor.LocatorNotResolved ex) {
                 String topicKey = normalizeTopic(plan.topicKey(), null, ex.getMessage());
