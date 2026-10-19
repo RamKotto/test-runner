@@ -97,14 +97,13 @@ public class TestCaseRunnerService {
                             List.of(c), false);
                 }
 
-                // HTML-снимок ДО действия — для воспроизводимости.
+                // HTML-снимок ДО действия. Ничего не делает при app.debug.dump-html=false.
                 uiExecutor.dumpHtml(session, tc.id(), i);
 
                 try {
                     enrichments.add(uiExecutor.executeStep(
                             session, i, plan, uiExecutor.currentUrl(session)));
                 } catch (AssertionFailure ex) {
-                    // Тест не прошёл, но данных хватило — это FAILED, не уточнение.
                     return new RunnerOutcome(new ExecutionOutcome(
                             tc.id(), tc.sourceFilename(), "FAILED",
                             "Шаг " + (i + 1) + ": " + ex.getMessage(), enrichments),
@@ -169,13 +168,11 @@ public class TestCaseRunnerService {
                     lastHeaders = result.responseHeaders();
                 if (result.responseStatusCode() != null) lastStatus = result.responseStatusCode();
             } catch (AssertionFailure ex) {
-                // Сравнение фактического результата с ожиданием — это FAILED.
                 return new RunnerOutcome(new ExecutionOutcome(
                         tc.id(), tc.sourceFilename(), "FAILED",
                         "Шаг " + (i + 1) + ": " + ex.getMessage(), enrichments),
                         List.of(), false);
             } catch (UiExecutor.LocatorNotResolved ex) {
-                // Не смогли построить/выполнить запрос — нужен ответ пользователя.
                 String topicKey = normalizeTopic(plan.topicKey(), ex.getMessage());
                 if (isSkippedInThisCase(tc, topicKey) || findAnswerInThisCase(tc, topicKey) != null) {
                     return skipped(tc, enrichments, i, ex.getMessage());
@@ -203,12 +200,6 @@ public class TestCaseRunnerService {
                 List.of(), false);
     }
 
-    /**
-     * Стабильный ключ темы уточнения.
-     * Приоритет: topicKey от LLM → reason → "clarification".
-     * Никогда не содержит URL/текста ошибки — только нормализованные слова,
-     * чтобы ответы пользователя можно было переиспользовать между итерациями.
-     */
     private String normalizeTopic(String topicKey, String reason) {
         if (topicKey != null && !topicKey.isBlank()) {
             String t = topicKey.trim().toLowerCase().replaceAll("[^a-z0-9_]+", "_");

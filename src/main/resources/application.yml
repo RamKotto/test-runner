@@ -23,6 +23,12 @@ app:
     ttl-minutes: 180
     max-count: 500
     max-markdown-chars: 1000000
+  # По умолчанию дампы отключены. Включать для отладки:
+  #   mvn spring-boot:run -Dspring-boot.run.arguments=--app.debug.dump-html=true
+  # или переменная окружения APP_DEBUG_DUMP_HTML=true
+  # или профиль: SPRING_PROFILES_ACTIVE=debug (см. application-debug.yml)
+  debug:
+    dump-html: ${APP_DEBUG_DUMP_HTML:false}
   prompts:
     plan-step: |
       Ты — исполнитель тест-кейсов. Тебе даны:

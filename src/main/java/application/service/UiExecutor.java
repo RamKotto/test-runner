@@ -5,6 +5,7 @@ import application.dto.Dtos.StepEnrichment;
 import application.exception.AssertionFailure;
 import com.microsoft.playwright.*;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.nio.file.Files;
@@ -17,6 +18,12 @@ public class UiExecutor {
     private final Playwright playwright;
     private final Browser browser;
     private final AppProperties appProps;
+
+    /**
+     * Включается только профилем debug / переменной окружения.
+     */
+    @Value("${app.debug.dump-html:false}")
+    private boolean dumpHtmlEnabled;
 
     public UiExecutor(AppProperties appProps) {
         this.appProps = appProps;
@@ -253,7 +260,6 @@ public class UiExecutor {
             sb.append("\n   • strategy: ").append(plan.locatorStrategy());
         }
 
-        // elementRole: из плана, иначе выводим из реального тега/type
         String derivedRole = plan.elementRole();
         if (derivedRole == null || derivedRole.isBlank()) {
             derivedRole = deriveRole(info);
@@ -262,7 +268,6 @@ public class UiExecutor {
             sb.append("\n   • role: ").append(derivedRole);
         }
 
-        // elementName: из плана, иначе берём видимый текст
         String derivedName = plan.elementName();
         if (derivedName == null || derivedName.isBlank()) {
             derivedName = info.text();
@@ -346,14 +351,22 @@ public class UiExecutor {
 
     /**
      * Сохраняет HTML-снимок страницы рядом со скачанными кейсами.
+     * Отключено по умолчанию — включается через app.debug.dump-html=true
+     * или профиль debug / переменную окружения APP_DEBUG_DUMP_HTML=true.
+     * <p>
+     * Агент (LLM) эти файлы НЕ читает. Они нужны только человеку-автоматизатору
+     * для воспроизведения проблемного состояния. В проде должны быть выключены.
      */
     public void dumpHtml(UiSession session, String testCaseId, int stepIndex) {
+        if (!dumpHtmlEnabled) {
+            return;
+        }
         try {
             Path dir = appProps.getDownload().getDirectory();
             Files.createDirectories(dir);
-            Files.writeString(
-                    dir.resolve(testCaseId + ".step" + (stepIndex + 1) + ".html"),
-                    session.page().content());
+            Path target = dir.resolve(testCaseId + ".step" + (stepIndex + 1) + ".html");
+            Files.writeString(target, session.page().content());
+            log.debug("dumpHtml: сохранён {}", target.toAbsolutePath());
         } catch (Exception e) {
             log.debug("dumpHtml failed: {}", e.getMessage());
         }
