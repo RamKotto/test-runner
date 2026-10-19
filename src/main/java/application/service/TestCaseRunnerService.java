@@ -60,10 +60,10 @@ public class TestCaseRunnerService {
     }
 
     /**
-     * Проверяет, был ли уже ответ SKIP на тему topicKey.
-     * Если да — уточнение по этой теме повторно не задаём, кейс пропускаем.
+     * Возвращает true, если по теме в рамках этого кейса уже был ответ SKIP.
+     * Ответы других кейсов не учитываются.
      */
-    private boolean isSkipped(ParsedTestCase tc, String topicKey) {
+    private boolean isSkippedInThisCase(ParsedTestCase tc, String topicKey) {
         if (topicKey == null || topicKey.isBlank() || tc.answers() == null) return false;
         String needle = topicKey.trim().toLowerCase();
         for (AnswerRequest.Answer a : tc.answers()) {
@@ -77,10 +77,10 @@ public class TestCaseRunnerService {
     }
 
     /**
-     * Проверяет, задавался ли уже вопрос с этой темой (независимо от ответа).
-     * Нужно для правила «не более 1 раза по конкретной теме».
+     * Возвращает true, если по теме в рамках этого кейса уже задавался вопрос
+     * (неважно, с каким ответом). Ответы других кейсов не учитываются.
      */
-    private boolean wasAsked(ParsedTestCase tc, String topicKey) {
+    private boolean wasAskedInThisCase(ParsedTestCase tc, String topicKey) {
         if (topicKey == null || topicKey.isBlank() || tc.answers() == null) return false;
         String needle = topicKey.trim().toLowerCase();
         for (AnswerRequest.Answer a : tc.answers()) {
@@ -88,6 +88,22 @@ public class TestCaseRunnerService {
             if (q.contains(needle)) return true;
         }
         return false;
+    }
+
+    /**
+     * Возвращает сохранённый ответ по теме в рамках этого кейса (если был).
+     * Ответы других кейсов не учитываются.
+     */
+    private String findAnswerInThisCase(ParsedTestCase tc, String topicKey) {
+        if (topicKey == null || topicKey.isBlank() || tc.answers() == null) return null;
+        String needle = topicKey.trim().toLowerCase();
+        for (AnswerRequest.Answer a : tc.answers()) {
+            String q = a.question() == null ? "" : a.question().toLowerCase();
+            if (q.contains(needle)) {
+                return a.answer();
+            }
+        }
+        return null;
     }
 
     private RunnerOutcome runUiCase(ParsedTestCase tc, String startUrl) {
@@ -98,7 +114,8 @@ public class TestCaseRunnerService {
             for (int i = 0; i < tc.steps().size(); i++) {
                 String step = tc.steps().get(i);
                 String html = uiExecutor.snapshotHtml(session);
-                StepPlanner.Plan plan = planner.planStep(tc, i, step, html, null);
+                StepPlanner.Plan plan = planner.planStep(tc, i, step, html, null,
+                        enrichments, null);
 
                 if (plan.isSkip()) {
                     log.info("{} шаг {}: модель вернула skip", tc.id(), i + 1);
@@ -108,10 +125,23 @@ public class TestCaseRunnerService {
                 if (plan.needsClarification()) {
                     String topicKey = normalizeTopic(plan.topicKey(), plan.question(), plan.reason());
 
-                    if (isSkipped(tc, topicKey) || wasAsked(tc, topicKey)) {
-                        log.info("{} шаг {}: тема {} уже задавалась — пропуск кейса",
+                    // SKIP по этой теме в этом кейсе → пропуск
+                    if (isSkippedInThisCase(tc, topicKey)) {
+                        log.info("{} шаг {}: тема {} — SKIP уже был в этом кейсе, пропуск",
                                 tc.id(), i + 1, topicKey);
                         return skipped(tc, enrichments, i, plan.reason());
+                    }
+
+                    // Вопрос по теме уже задавался в этом кейсе → используем ответ, не спрашиваем
+                    String existing = findAnswerInThisCase(tc, topicKey);
+                    if (existing != null && !existing.isBlank()) {
+                        log.info("{} шаг {}: тема {} — ответ уже есть в этом кейсе, используем: {}",
+                                tc.id(), i + 1, topicKey, existing);
+                        // Ответ уже был передан в промпт при планировании.
+                        // Если модель всё равно вернула needClarification — значит,
+                        // ответ не помог. Пропускаем кейс, чтобы не зациклиться.
+                        return skipped(tc, enrichments, i,
+                                "ответ по теме был, но шаг всё равно не выполнен");
                     }
 
                     Clarification c = new Clarification(
@@ -133,11 +163,21 @@ public class TestCaseRunnerService {
                     enrichments.add(e);
                 } catch (UiExecutor.LocatorNotResolved ex) {
                     String topicKey = normalizeTopic(plan.topicKey(), null, ex.getMessage());
-                    if (isSkipped(tc, topicKey) || wasAsked(tc, topicKey)) {
-                        log.info("{} шаг {}: тема {} уже задавалась — пропуск кейса",
+
+                    if (isSkippedInThisCase(tc, topicKey)) {
+                        log.info("{} шаг {}: тема {} — SKIP уже был в этом кейсе, пропуск",
                                 tc.id(), i + 1, topicKey);
                         return skipped(tc, enrichments, i, ex.getMessage());
                     }
+
+                    String existing = findAnswerInThisCase(tc, topicKey);
+                    if (existing != null && !existing.isBlank()) {
+                        log.info("{} шаг {}: тема {} — ответ уже есть, но шаг не выполнен, пропуск",
+                                tc.id(), i + 1, topicKey);
+                        return skipped(tc, enrichments, i,
+                                "ответ по теме был, но шаг всё равно не выполнен");
+                    }
+
                     Clarification c = new Clarification(
                             tc.id(), i,
                             withTopic("Шаг " + (i + 1) + " («" + step + "»): " + ex.getMessage(), topicKey),
@@ -165,10 +205,12 @@ public class TestCaseRunnerService {
 
     private RunnerOutcome runApiCase(ParsedTestCase tc, String apiBaseUrl) {
         List<StepEnrichment> enrichments = new ArrayList<>();
+        String lastBody = null;
 
         for (int i = 0; i < tc.steps().size(); i++) {
             String step = tc.steps().get(i);
-            StepPlanner.Plan plan = planner.planStep(tc, i, step, null, apiBaseUrl);
+            StepPlanner.Plan plan = planner.planStep(tc, i, step, null, apiBaseUrl,
+                    enrichments, lastBody);
 
             if (plan.isSkip()) {
                 log.info("{} шаг {}: модель вернула skip", tc.id(), i + 1);
@@ -178,10 +220,18 @@ public class TestCaseRunnerService {
             if (plan.needsClarification()) {
                 String topicKey = normalizeTopic(plan.topicKey(), plan.question(), plan.reason());
 
-                if (isSkipped(tc, topicKey) || wasAsked(tc, topicKey)) {
-                    log.info("{} шаг {}: тема {} уже задавалась — пропуск кейса",
+                if (isSkippedInThisCase(tc, topicKey)) {
+                    log.info("{} шаг {}: тема {} — SKIP уже был в этом кейсе, пропуск",
                             tc.id(), i + 1, topicKey);
                     return skipped(tc, enrichments, i, plan.reason());
+                }
+
+                String existing = findAnswerInThisCase(tc, topicKey);
+                if (existing != null && !existing.isBlank()) {
+                    log.info("{} шаг {}: тема {} — ответ уже есть, но шаг не выполнен, пропуск",
+                            tc.id(), i + 1, topicKey);
+                    return skipped(tc, enrichments, i,
+                            "ответ по теме был, но шаг всё равно не выполнен");
                 }
 
                 Clarification c = new Clarification(
@@ -198,15 +248,29 @@ public class TestCaseRunnerService {
             }
 
             try {
-                StepEnrichment e = apiExecutor.executeStep(i, plan, apiBaseUrl, Map.of(), Map.of());
-                enrichments.add(e);
+                ApiExecutor.ApiStepResult result = apiExecutor.executeStep(
+                        i, plan, apiBaseUrl, Map.of(), Map.of(), lastBody);
+                enrichments.add(result.enrichment());
+                if (result.responseBody() != null) {
+                    lastBody = result.responseBody();
+                }
             } catch (UiExecutor.LocatorNotResolved ex) {
                 String topicKey = normalizeTopic(plan.topicKey(), null, ex.getMessage());
-                if (isSkipped(tc, topicKey) || wasAsked(tc, topicKey)) {
-                    log.info("{} шаг {}: тема {} уже задавалась — пропуск кейса",
+
+                if (isSkippedInThisCase(tc, topicKey)) {
+                    log.info("{} шаг {}: тема {} — SKIP уже был в этом кейсе, пропуск",
                             tc.id(), i + 1, topicKey);
                     return skipped(tc, enrichments, i, ex.getMessage());
                 }
+
+                String existing = findAnswerInThisCase(tc, topicKey);
+                if (existing != null && !existing.isBlank()) {
+                    log.info("{} шаг {}: тема {} — ответ уже есть, но шаг не выполнен, пропуск",
+                            tc.id(), i + 1, topicKey);
+                    return skipped(tc, enrichments, i,
+                            "ответ по теме был, но шаг всё равно не выполнен");
+                }
+
                 Clarification c = new Clarification(
                         tc.id(), i,
                         withTopic("Шаг " + (i + 1) + " («" + step + "»): " + ex.getMessage(), topicKey),

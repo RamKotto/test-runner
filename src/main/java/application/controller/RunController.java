@@ -119,7 +119,6 @@ public class RunController {
                 stoppedAt = i;
                 return new RunExecution(outcomes, clarifications, stoppedAt);
             }
-
             // SKIPPED и FAILED не прерывают прогон — переходим к следующему кейсу
         }
         return new RunExecution(outcomes, clarifications, stoppedAt);

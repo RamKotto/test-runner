@@ -3,12 +3,14 @@ package application.service;
 import application.config.AppProperties;
 import application.dto.Dtos.AnswerRequest;
 import application.dto.Dtos.ParsedTestCase;
+import application.dto.Dtos.StepEnrichment;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.util.List;
 import java.util.Map;
 
 @Slf4j
@@ -45,22 +47,35 @@ public class StepPlanner {
                          int stepIndex,
                          String stepText,
                          String uiHtmlSnapshot,
-                         String apiBaseUrl) {
+                         String apiBaseUrl,
+                         List<StepEnrichment> previousEnrichments,
+                         String lastResponseBody) {
         StringBuilder user = new StringBuilder();
         user.append("Тип кейса: ").append(tc.type()).append("\n");
         user.append("Тест-кейс: ").append(tc.id()).append(" — ").append(tc.title()).append("\n");
         user.append("Ожидаемый результат всего кейса: ").append(tc.expectedResult()).append("\n\n");
         user.append("Шаг #").append(stepIndex + 1).append(": ").append(stepText).append("\n\n");
 
+        // Ответы пользователя (накопленные в этом кейсе)
         if (tc.answers() != null && !tc.answers().isEmpty()) {
-            user.append("Ранее пользователь ответил на уточнения:\n");
+            user.append("Ранее пользователь ответил на уточнения в этом кейсе:\n");
             for (AnswerRequest.Answer a : tc.answers()) {
                 user.append("- Вопрос: ").append(a.question()).append("\n");
                 user.append("  Ответ: ").append(a.answer()).append("\n");
             }
-            user.append("\nИспользуй эти ответы при планировании шага. ");
-            user.append("Не задавай повторно те же вопросы. ");
+            user.append("\nИспользуй эти ответы. Не задавай повторно те же вопросы. ");
             user.append("Если ответ равен SKIP — верни operation=\"skip\".\n\n");
+        }
+
+        // Уже выполненные шаги этого кейса
+        if (previousEnrichments != null && !previousEnrichments.isEmpty()) {
+            user.append("Уже выполненные шаги этого кейса:\n");
+            for (StepEnrichment e : previousEnrichments) {
+                user.append("- Шаг ").append(e.stepIndex() + 1).append(": ")
+                        .append(e.action()).append(" → ").append(e.detail()).append("\n");
+            }
+            user.append("\nУчитывай это: если нужный API-запрос уже выполнен — используй его результат, ");
+            user.append("не повторяй запрос. Для проверки тела используй operation=\"assertBody\".\n\n");
         }
 
         if (uiHtmlSnapshot != null && !uiHtmlSnapshot.isBlank()) {
@@ -68,9 +83,17 @@ public class StepPlanner {
             user.append(uiHtmlSnapshot.length() > 12000
                     ? uiHtmlSnapshot.substring(0, 12000)
                     : uiHtmlSnapshot);
+            user.append("\n");
         }
         if (apiBaseUrl != null && !apiBaseUrl.isBlank()) {
-            user.append("\n\nAPI base URL: ").append(apiBaseUrl);
+            user.append("\nAPI base URL: ").append(apiBaseUrl);
+        }
+        if (lastResponseBody != null && !lastResponseBody.isBlank()) {
+            user.append("\nТело последнего ответа API (обрезано):\n");
+            user.append(lastResponseBody.length() > 8000
+                    ? lastResponseBody.substring(0, 8000)
+                    : lastResponseBody);
+            user.append("\n");
         }
 
         String response = openRouter.complete(appProps.getPrompts().getPlanStep(), user.toString());

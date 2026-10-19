@@ -14,15 +14,46 @@ import java.util.Map;
 @Service
 public class ApiExecutor {
 
-    public StepEnrichment executeStep(int stepIndex,
-                                      StepPlanner.Plan plan,
-                                      String apiBaseUrl,
-                                      Map<String, String> headers,
-                                      Map<String, String> pathParams) {
-        String method = plan.method() == null ? "GET" : plan.method().toUpperCase();
+    /**
+     * Результат выполнения API-шага: enrichment + тело последнего ответа.
+     */
+    public record ApiStepResult(StepEnrichment enrichment, String responseBody) {
+    }
+
+    public ApiStepResult executeStep(int stepIndex,
+                                     StepPlanner.Plan plan,
+                                     String apiBaseUrl,
+                                     Map<String, String> headers,
+                                     Map<String, String> pathParams,
+                                     String lastResponseBody) {
+
+        String op = plan.operation() == null ? "" : plan.operation().toLowerCase();
+
+        // assertBody — проверка подстроки в уже полученном теле ответа
+        if ("assertbody".equals(op)) {
+            String expected = plan.value();
+            if (expected == null || expected.isBlank()) {
+                throw new UiExecutor.LocatorNotResolved("assertBody: не указано значение для проверки");
+            }
+            if (lastResponseBody == null) {
+                throw new UiExecutor.LocatorNotResolved(
+                        "assertBody: нет тела предыдущего ответа — сначала выполните apiCall");
+            }
+            if (!lastResponseBody.contains(expected)) {
+                throw new UiExecutor.LocatorNotResolved(
+                        "assertBody: тело ответа не содержит `" + expected + "`");
+            }
+            StepEnrichment e = new StepEnrichment(stepIndex, "assertBody",
+                    "assertBody → тело ответа содержит `" + expected + "`");
+            log.info("API-шаг {}: {}", stepIndex + 1, e.detail());
+            return new ApiStepResult(e, lastResponseBody);
+        }
+
+        // apiCall — отправка запроса
+        String method = plan.method() == null ? "" : plan.method().trim().toUpperCase();
+        if (method.isEmpty()) method = "GET";
         String path = plan.path();
 
-        // Пытаемся вычислить полный URL
         String fullUrl = buildFullUrl(apiBaseUrl, path);
         if (fullUrl == null || fullUrl.isBlank()) {
             throw new UiExecutor.LocatorNotResolved("не указан apiBaseUrl и path для API-кейса");
@@ -68,29 +99,20 @@ public class ApiExecutor {
                             + ", ожидалось " + expected);
         }
 
+        String body = response.getBody() == null ? "" : response.getBody().asString();
         String detail = "apiCall → `" + method + " " + fullUrl + "` → HTTP " + actual;
         log.info("API-шаг {}: {}", stepIndex + 1, detail);
-        return new StepEnrichment(stepIndex, "apiCall", detail);
+        return new ApiStepResult(new StepEnrichment(stepIndex, "apiCall", detail), body);
     }
 
-    /**
-     * Собирает полный URL:
-     * - apiBaseUrl + path (если apiBaseUrl — база, path — путь)
-     * - path как полный URL (если LLM вернул полный URL)
-     * - apiBaseUrl уже содержит path (если LLM вернул полный URL в value)
-     */
     private String buildFullUrl(String apiBaseUrl, String path) {
-        // Если path — полный URL, используем его как есть
         if (path != null && (path.startsWith("http://") || path.startsWith("https://"))) {
             return path;
         }
-        // Если apiBaseUrl — полный URL на конкретный ресурс (содержит путь)
-        // и path пустой — используем apiBaseUrl
         if ((path == null || path.isBlank()) && apiBaseUrl != null
                 && (apiBaseUrl.startsWith("http://") || apiBaseUrl.startsWith("https://"))) {
             return apiBaseUrl;
         }
-        // Стандартная склейка
         if (apiBaseUrl != null && path != null) {
             if (apiBaseUrl.endsWith("/") && path.startsWith("/")) {
                 return apiBaseUrl.substring(0, apiBaseUrl.length() - 1) + path;
