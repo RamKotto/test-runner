@@ -8,9 +8,7 @@ import org.springframework.stereotype.Service;
 
 import java.time.Duration;
 import java.time.Instant;
-import java.util.Comparator;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Service
@@ -39,7 +37,8 @@ public class SessionStore {
         }
         sessions.put(taskId, new Session(
                 session.testCases(), session.startUrl(), session.apiBaseUrl(),
-                session.currentTestCaseIndex(), Instant.now(), session.answers()));
+                session.currentTestCaseIndex(), Instant.now(),
+                dedupe(session.answers())));
     }
 
     public Session get(String taskId) {
@@ -49,6 +48,17 @@ public class SessionStore {
 
     public void remove(String taskId) {
         sessions.remove(taskId);
+    }
+
+    private static List<AnswerRequest.Answer> dedupe(List<AnswerRequest.Answer> answers) {
+        if (answers == null || answers.isEmpty()) return List.of();
+        Map<String, AnswerRequest.Answer> byKey = new LinkedHashMap<>();
+        for (AnswerRequest.Answer a : answers) {
+            String key = (a.topicKey() == null ? "" : a.topicKey().toLowerCase())
+                    + "|" + (a.question() == null ? "" : a.question().toLowerCase());
+            byKey.put(key, a);
+        }
+        return new ArrayList<>(byKey.values());
     }
 
     private void cleanup() {

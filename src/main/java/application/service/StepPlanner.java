@@ -11,6 +11,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -20,20 +21,30 @@ import java.util.Set;
 @RequiredArgsConstructor
 public class StepPlanner {
 
-    // PATCH: коллизия assertBody устранена — для UI теперь assertPageText.
-    private static final Set<String> UI_OPS = Set.of(
+    public static final Set<String> UI_OPS = Set.of(
             "navigate", "click", "fill", "asserttext", "waitfortext", "assertpagetext");
-    private static final Set<String> API_OPS = Set.of(
+    public static final Set<String> API_OPS = Set.of(
             "apicall", "assertbody", "assertheader", "assertstatus", "parsejson");
 
     private final OpenRouterClient openRouter;
     private final AppProperties appProps;
     private final ObjectMapper mapper;
 
+    public record ElementTarget(
+            String locator,
+            String locatorStrategy,
+            String elementRole,
+            String elementName,
+            List<String> alternatives
+    ) {
+    }
+
     public record Plan(
             String operation, String locator, String value, String method, String path,
             String bodyJson, Integer expectedStatus, String topicKey, String question, String reason,
-            String locatorStrategy, String elementRole, String elementName, String locatorAlternatives
+            String locatorStrategy, String elementRole, String elementName, String locatorAlternatives,
+            List<ElementTarget> elements,
+            String requestHeaders
     ) {
         public boolean needsClarification() {
             return "needClarification".equalsIgnoreCase(operation);
@@ -48,19 +59,72 @@ public class StepPlanner {
             return UI_OPS.contains(op);
         }
 
-        // PATCH: валидация плана против типа кейса. Вызывается из planStep.
+        public boolean isApiOperation() {
+            String op = operation == null ? "" : operation.toLowerCase();
+            return API_OPS.contains(op);
+        }
+
         public Plan validateAgainst(String caseType) {
             if (isSkip() || needsClarification()) return this;
             String op = operation == null ? "" : operation.toLowerCase();
-            boolean apiCase = "API".equalsIgnoreCase(caseType);
-            Set<String> allowed = apiCase ? API_OPS : UI_OPS;
-            if (!allowed.contains(op)) {
-                throw new GenerationException(
-                        "План не соответствует типу кейса (" + caseType + "): operation=" + op
-                                + ". Разрешены: " + allowed);
+            String t = caseType == null ? "" : caseType.trim().toUpperCase();
+
+            switch (t) {
+                case "UI" -> {
+                    if (!UI_OPS.contains(op)) {
+                        throw new GenerationException(
+                                "План не соответствует типу кейса (UI): operation=" + op
+                                        + ". Разрешены: " + UI_OPS);
+                    }
+                }
+                case "API" -> {
+                    if (!API_OPS.contains(op)) {
+                        throw new GenerationException(
+                                "План не соответствует типу кейса (API): operation=" + op
+                                        + ". Разрешены: " + API_OPS);
+                    }
+                }
+                case "E2E", "NEGATIVE", "SECURITY" -> {
+                    if (!UI_OPS.contains(op) && !API_OPS.contains(op)) {
+                        throw new GenerationException(
+                                "План не соответствует типу кейса (" + t + "): operation=" + op
+                                        + ". Разрешены: " + UI_OPS + " ∪ " + API_OPS);
+                    }
+                }
+                default -> log.warn("validateAgainst: неизвестный тип кейса '{}', пропускаю", t);
             }
             return this;
         }
+
+        public List<ElementTarget> effectiveElements() {
+            if (elements != null && !elements.isEmpty()) return elements;
+            if (locator != null && !locator.isBlank()) {
+                return List.of(new ElementTarget(
+                        locator, locatorStrategy, elementRole, elementName,
+                        splitAlternativesInternal(locatorAlternatives)));
+            }
+            return List.of();
+        }
+    }
+
+    private static List<String> splitAlternativesInternal(String alts) {
+        if (alts == null || alts.isBlank() || "null".equalsIgnoreCase(alts)) return List.of();
+        String s = alts.trim();
+        if (s.startsWith("[")) {
+            try {
+                var m = new com.fasterxml.jackson.databind.ObjectMapper();
+                var arr = m.readTree(s);
+                if (arr.isArray()) {
+                    List<String> out = new ArrayList<>();
+                    for (var n : arr) out.add(n.asText());
+                    return out;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        List<String> out = new ArrayList<>();
+        for (String p : s.split(",")) if (!p.isBlank()) out.add(p.trim());
+        return out;
     }
 
     public Plan planStep(ParsedTestCase tc, int stepIndex, String stepText, String domSnapshot,
@@ -87,7 +151,7 @@ public class StepPlanner {
             for (StepEnrichment e : previousEnrichments) {
                 user.append("- Шаг ").append(e.stepIndex() + 1)
                         .append(": ").append(e.action()).append(" → ")
-                        .append(e.detail()).append("\n");
+                        .append(truncate(e.detail(), 500)).append("\n");
             }
             user.append("\nДля проверки тела используй assertBody, заголовка — assertHeader, ")
                     .append("валидности JSON — parseJson, статуса — assertStatus.\n\n");
@@ -95,7 +159,7 @@ public class StepPlanner {
 
         if (domSnapshot != null && !domSnapshot.isBlank()) {
             user.append("DOM-СНАПШОТ страницы (только интерактивные элементы с атрибутами):\n");
-            user.append(domSnapshot.length() > 30000 ? domSnapshot.substring(0, 30000) : domSnapshot)
+            user.append(domSnapshot.length() > 40000 ? domSnapshot.substring(0, 40000) : domSnapshot)
                     .append("\n");
         }
         if (apiBaseUrl != null && !apiBaseUrl.isBlank()) {
@@ -112,8 +176,8 @@ public class StepPlanner {
         }
         if (lastResponseBody != null && !lastResponseBody.isBlank()) {
             user.append("\nТело последнего ответа API:\n")
-                    .append(lastResponseBody.length() > 8000
-                            ? lastResponseBody.substring(0, 8000) : lastResponseBody)
+                    .append(lastResponseBody.length() > 12000
+                            ? lastResponseBody.substring(0, 12000) : lastResponseBody)
                     .append("\n");
         }
 
@@ -122,34 +186,63 @@ public class StepPlanner {
         try {
             Map<String, Object> map = mapper.readValue(cleaned, new TypeReference<>() {
             });
+            List<ElementTarget> elements = parseElements(map.get("elements"));
             Plan plan = new Plan(
                     str(map.get("operation")), str(map.get("locator")), str(map.get("value")),
                     str(map.get("method")), str(map.get("path")), str(map.get("bodyJson")),
                     parseExpectedStatus(map.get("expectedStatus")),
                     str(map.get("topicKey")), str(map.get("question")), str(map.get("reason")),
                     str(map.get("locatorStrategy")), str(map.get("elementRole")),
-                    str(map.get("elementName")), str(map.get("locatorAlternatives"))
+                    str(map.get("elementName")), str(map.get("locatorAlternatives")),
+                    elements, str(map.get("requestHeaders"))
             );
-            // PATCH (P1): валидация плана прямо здесь — до executor.
             return plan.validateAgainst(tc.type());
         } catch (GenerationException e) {
             throw e;
         } catch (Exception e) {
-            throw new GenerationException(
-                    "Модель вернула невалидный JSON: " + e.getMessage(), e);
+            throw new GenerationException("Модель вернула невалидный JSON: " + e.getMessage(), e);
         }
     }
 
-    // PATCH: принимаем и число, и строку из 3 цифр.
+    private List<ElementTarget> parseElements(Object raw) {
+        if (raw == null) return List.of();
+        if (!(raw instanceof List<?> list)) return List.of();
+        List<ElementTarget> out = new ArrayList<>();
+        for (Object item : list) {
+            if (!(item instanceof Map<?, ?> m)) continue;
+            Object loc = m.get("locator");
+            if (loc == null || loc.toString().isBlank()) continue;
+            List<String> alts = new ArrayList<>();
+            Object altRaw = m.get("alternatives");
+            if (altRaw instanceof List<?> al) {
+                for (Object a : al) if (a != null) alts.add(a.toString());
+            } else if (altRaw != null) {
+                alts = splitAlternativesInternal(altRaw.toString());
+            }
+            out.add(new ElementTarget(
+                    loc.toString(),
+                    str(m.get("locatorStrategy")),
+                    str(m.get("elementRole")),
+                    str(m.get("elementName")),
+                    alts
+            ));
+        }
+        return out;
+    }
+
     private static Integer parseExpectedStatus(Object raw) {
         if (raw == null) return null;
         if (raw instanceof Number n) return n.intValue();
         if (raw instanceof String s && s.matches("\\d{3}")) return Integer.parseInt(s);
-        throw new GenerationException(
-                "expectedStatus должен быть числом из 3 цифр, получено: " + raw);
+        throw new GenerationException("expectedStatus должен быть числом из 3 цифр, получено: " + raw);
     }
 
     private static String str(Object o) {
         return o == null ? null : o.toString();
+    }
+
+    private static String truncate(String s, int max) {
+        if (s == null) return "";
+        return s.length() <= max ? s : s.substring(0, max) + "…";
     }
 }

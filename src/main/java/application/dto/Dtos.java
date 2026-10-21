@@ -10,15 +10,11 @@ public class Dtos {
         }
     }
 
-    // PATCH: добавлено topicKey в Answer — чтобы resolveApiBaseUrl/resolveStartUrl
-    // матчили ответы по теме, а не «любой URL из ответа».
     public record AnswerRequest(List<Answer> answers) {
         public record Answer(String question, String answer, String topicKey) {
         }
     }
 
-    // PATCH: добавлено category — агент сможет авто-переклассифицировать кейс
-    // (CASE_TYPE_MISMATCH / LOCATOR_NOT_FOUND / DATA_MISSING / UNSUPPORTED_OP).
     public record Clarification(
             String testCaseId,
             Integer stepIndex,
@@ -28,7 +24,69 @@ public class Dtos {
     ) {
     }
 
-    public record StepEnrichment(int stepIndex, String action, String detail) {
+    /**
+     * Один элемент, к которому относится шаг. Для multi-element шага
+     * (например, «проверить все строки таблицы») elements.size() == N.
+     */
+    public record ElementInfo(
+            int index,
+            String locator,
+            String xpath,
+            String tag,
+            String testidOrId,
+            String role,
+            String ariaLabel,
+            String type,
+            String text,
+            Integer count,
+            List<String> alternativesCss,
+            List<String> alternativesXpath
+    ) {
+    }
+
+    /**
+     * Обогащение шага. Универсальное: и UI, и API.
+     * - elements       — затронутые DOM-элементы (для UI), пусто для API;
+     * - requestCurl    — готовый curl для копирования (для API), null для UI;
+     * - requestBody    — тело запроса (для API), null для UI;
+     * - responseSample — пример ответа (обрезанный), null для UI;
+     * - subEnrichments — вложенные enrichment'ы (например, для E2E «открыть + curl + проверить»).
+     */
+    public record StepEnrichment(
+            int stepIndex,
+            String action,
+            String detail,
+            List<ElementInfo> elements,
+            String requestCurl,
+            String requestBody,
+            String responseSample,
+            List<StepEnrichment> subEnrichments
+    ) {
+        public StepEnrichment(int stepIndex, String action, String detail) {
+            this(stepIndex, action, detail, List.of(), null, null, null, List.of());
+        }
+
+        public static StepEnrichment ui(int stepIndex, String action, String detail,
+                                        List<ElementInfo> elements) {
+            return new StepEnrichment(stepIndex, action, detail, elements,
+                    null, null, null, List.of());
+        }
+
+        public static StepEnrichment api(int stepIndex, String action, String detail,
+                                         String requestCurl, String requestBody,
+                                         String responseSample) {
+            return new StepEnrichment(stepIndex, action, detail, List.of(),
+                    requestCurl, requestBody, responseSample, List.of());
+        }
+
+        public static StepEnrichment apiWithSub(int stepIndex, String action, String detail,
+                                                String requestCurl, String requestBody,
+                                                String responseSample,
+                                                List<StepEnrichment> subs) {
+            return new StepEnrichment(stepIndex, action, detail, List.of(),
+                    requestCurl, requestBody, responseSample,
+                    subs == null ? List.of() : subs);
+        }
     }
 
     public record ExecutionOutcome(

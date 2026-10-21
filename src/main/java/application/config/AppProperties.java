@@ -27,6 +27,17 @@ public class AppProperties {
     @Valid
     private Prompts prompts = new Prompts();
 
+    /**
+     * Допустимые типы тест-кейсов.
+     */
+    private List<String> caseTypes = new ArrayList<>(
+            List.of("UI", "API", "E2E", "NEGATIVE", "SECURITY"));
+
+    /**
+     * 0 = без ограничения; иначе — максимум символов тела ответа в enrichment.
+     */
+    private int enrichmentBodyLimit = 0;
+
     @Data
     public static class Storage {
         private Path directory = Path.of("./data/enriched");
@@ -40,7 +51,7 @@ public class AppProperties {
         @Min(1)
         private int connectTimeoutSeconds = 10;
         @Min(1)
-        private int readTimeoutSeconds = 120;
+        private int readTimeoutSeconds = 300;
         private List<String> allowedHosts = new ArrayList<>(List.of("localhost"));
     }
 

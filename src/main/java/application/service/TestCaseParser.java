@@ -6,6 +6,7 @@ import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -15,11 +16,11 @@ public class TestCaseParser {
 
     private static final Pattern HEADER = Pattern.compile("^#\\s+(TC-[A-Z0-9\\-]+)\\s+[—-]\\s+(.+)$");
     private static final Pattern FIELD = Pattern.compile("^-\\s+\\*\\*([^*]+):\\*\\*\\s*(.+)$");
-
-    private static final Pattern INDEX_ENTRY =
-            Pattern.compile("\\[([^\\]]+)]\\(([^)]+\\.md)\\)");
-
+    private static final Pattern INDEX_ENTRY = Pattern.compile("\\[([^\\]]+)]\\(([^)]+\\.md)\\)");
     private static final Pattern SAFE_NAME = Pattern.compile("^([a-zA-Z0-9_\\-]+\\.md)$");
+
+    private static final Set<String> KNOWN_TYPES =
+            Set.of("UI", "API", "E2E", "NEGATIVE", "SECURITY");
 
     public boolean isIndexMarkdown(String md) {
         return md != null && md.startsWith("# Тест-кейсы — индекс");
@@ -30,9 +31,7 @@ public class TestCaseParser {
         for (String line : md.split("\\R")) {
             Matcher m = INDEX_ENTRY.matcher(line.trim());
             if (m.find()) {
-                String testCaseId = m.group(1);
-                String relPath = m.group(2);
-                result.add(new IndexEntry(testCaseId, relPath));
+                result.add(new IndexEntry(m.group(1), m.group(2)));
             }
         }
         return result;
@@ -40,9 +39,7 @@ public class TestCaseParser {
 
     public String toSafeFilename(String relativePath) {
         String base = relativePath.replace("\\", "/");
-        if (base.startsWith("./")) {
-            base = base.substring(2);
-        }
+        if (base.startsWith("./")) base = base.substring(2);
         int slash = base.lastIndexOf('/');
         if (slash >= 0) base = base.substring(slash + 1);
         if (!SAFE_NAME.matcher(base).matches()) return null;
@@ -104,7 +101,6 @@ public class TestCaseParser {
             } else if ("preconditions".equals(section)) {
                 if (line.startsWith("- ")) preconditions.add(line.substring(2).strip());
             } else if ("expected".equals(section)) {
-                // PATCH: поддержка markdown-списков в «Ожидаемый результат».
                 if (line.startsWith("- ")) {
                     String item = line.substring(2).strip();
                     expectedResult = expectedResult.isBlank() ? item : expectedResult + " " + item;
@@ -118,10 +114,17 @@ public class TestCaseParser {
             throw new IllegalArgumentException("Не удалось распарсить тест-кейс: " + sourceFilename
                     + " (id=" + id + ", steps=" + steps.size() + ")");
         }
-        // PATCH: не угадываем тип — помечаем INVALID, чтобы не маскировать дефект генератора.
         if (type == null) {
             log.warn("TC {}: не указан тип кейса, помечаю как INVALID", id);
             type = "INVALID";
+        } else {
+            String norm = type.trim().toUpperCase();
+            if (!KNOWN_TYPES.contains(norm)) {
+                log.warn("TC {}: неизвестный тип '{}', помечаю как INVALID", id, type);
+                type = "INVALID";
+            } else {
+                type = norm;
+            }
         }
         return new ParsedTestCase(id, type, title, requirementRef, preconditions, steps,
                 expectedResult, priority, sourceFilename, markdown, List.of());
