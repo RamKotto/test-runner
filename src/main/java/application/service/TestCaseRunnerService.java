@@ -6,15 +6,18 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class TestCaseRunnerService {
+
+    // PATCH: жёсткие наборы допустимых операций по типу кейса.
+    private static final Set<String> UI_OPS = Set.of(
+            "navigate", "click", "fill", "asserttext", "waitfortext", "assertpagetext");
+    private static final Set<String> API_OPS = Set.of(
+            "apicall", "assertbody", "assertheader", "assertstatus", "parsejson");
 
     private final StepPlanner planner;
     private final UiExecutor uiExecutor;
@@ -26,18 +29,39 @@ public class TestCaseRunnerService {
     }
 
     public RunnerOutcome runCase(ParsedTestCase tc, String startUrl, String apiBaseUrl) {
+        // PATCH: INVALID-кейсы (без типа) не гоняем.
+        if ("INVALID".equalsIgnoreCase(tc.type())) {
+            return new RunnerOutcome(new ExecutionOutcome(
+                    tc.id(), tc.sourceFilename(), "SKIPPED",
+                    "Не указан тип кейса (UI/API)", List.of()),
+                    List.of(), true);
+        }
+
         String effectiveApiBaseUrl = resolveApiBaseUrl(tc, apiBaseUrl);
         String effectiveStartUrl = resolveStartUrl(tc, startUrl);
         if (isApiType(tc)) return runApiCase(tc, effectiveApiBaseUrl);
         return runUiCase(tc, effectiveStartUrl);
     }
 
+    // PATCH: без эвристик по подстрокам. Только явный контракт.
+    private boolean isApiType(ParsedTestCase tc) {
+        if (tc.type() == null) return false;
+        String t = tc.type().trim().toUpperCase();
+        if (!t.equals("UI") && !t.equals("API")) {
+            log.warn("TC {}: неизвестный type='{}', трактую как UI", tc.id(), tc.type());
+            return false;
+        }
+        return t.equals("API");
+    }
+
+    // PATCH: матчим ответ по topicKey, а не «любой URL».
     private String resolveApiBaseUrl(ParsedTestCase tc, String fallback) {
         if (fallback != null && !fallback.isBlank()) return fallback;
         if (tc.answers() == null) return null;
         for (AnswerRequest.Answer a : tc.answers()) {
-            String ans = a.answer();
-            if (ans != null && (ans.startsWith("http://") || ans.startsWith("https://"))) return ans;
+            if (a.topicKey() != null && a.topicKey().equalsIgnoreCase("api_base_url")) {
+                return a.answer();
+            }
         }
         return fallback;
     }
@@ -46,8 +70,9 @@ public class TestCaseRunnerService {
         if (fallback != null && !fallback.isBlank()) return fallback;
         if (tc.answers() == null) return null;
         for (AnswerRequest.Answer a : tc.answers()) {
-            String ans = a.answer();
-            if (ans != null && (ans.startsWith("http://") || ans.startsWith("https://"))) return ans;
+            if (a.topicKey() != null && a.topicKey().equalsIgnoreCase("start_url")) {
+                return a.answer();
+            }
         }
         return fallback;
     }
@@ -83,6 +108,8 @@ public class TestCaseRunnerService {
                 StepPlanner.Plan plan = planner.planStep(
                         tc, i, step, dom, null, enrichments, null, null, null);
 
+                // PATCH (P0): план обязан соответствовать типу кейса.
+                // Никаких NEEDS_CLARIFICATION для этой ситуации — это FAILED.
                 if (plan.isSkip()) return skipped(tc, enrichments, i, plan.reason());
                 if (plan.needsClarification()) {
                     String topicKey = normalizeTopic(plan.topicKey(), plan.reason());
@@ -90,20 +117,41 @@ public class TestCaseRunnerService {
                         return skipped(tc, enrichments, i, "ответ по теме был, но шаг не выполнен");
                     }
                     Clarification c = new Clarification(tc.id(), i,
-                            withTopic(plan.question(), topicKey), plan.reason());
+                            withTopic(plan.question(), topicKey), plan.reason(),
+                            "DATA_MISSING");
                     return new RunnerOutcome(new ExecutionOutcome(
                             tc.id(), tc.sourceFilename(),
                             "NEEDS_CLARIFICATION", "Прервано на шаге " + (i + 1), enrichments),
                             List.of(c), false);
                 }
 
-                // HTML-снимок ДО действия. Ничего не делает при app.debug.dump-html=false.
+                String op = plan.operation() == null ? "" : plan.operation().toLowerCase();
+                if (API_OPS.contains(op)) {
+                    return new RunnerOutcome(new ExecutionOutcome(
+                            tc.id(), tc.sourceFilename(), "FAILED",
+                            "Шаг " + (i + 1) + ": UI-кейс требует API-операцию '" + op
+                                    + "'. Переклассифицируйте кейс (type=API) или исправьте шаг.",
+                            enrichments), List.of(), false);
+                }
+                if (!UI_OPS.contains(op)) {
+                    return new RunnerOutcome(new ExecutionOutcome(
+                            tc.id(), tc.sourceFilename(), "FAILED",
+                            "Шаг " + (i + 1) + ": неизвестная UI-операция '" + op + "'",
+                            enrichments), List.of(), false);
+                }
+
                 uiExecutor.dumpHtml(session, tc.id(), i);
 
                 try {
                     enrichments.add(uiExecutor.executeStep(
                             session, i, plan, uiExecutor.currentUrl(session)));
                 } catch (AssertionFailure ex) {
+                    return new RunnerOutcome(new ExecutionOutcome(
+                            tc.id(), tc.sourceFilename(), "FAILED",
+                            "Шаг " + (i + 1) + ": " + ex.getMessage(), enrichments),
+                            List.of(), false);
+                } catch (UiExecutor.UnsupportedUiOperation ex) {
+                    // PATCH: это дефект планирования, а не «не нашли локатор».
                     return new RunnerOutcome(new ExecutionOutcome(
                             tc.id(), tc.sourceFilename(), "FAILED",
                             "Шаг " + (i + 1) + ": " + ex.getMessage(), enrichments),
@@ -115,7 +163,8 @@ public class TestCaseRunnerService {
                     }
                     Clarification c = new Clarification(tc.id(), i,
                             withTopic("Шаг " + (i + 1) + " («" + step + "»): " + ex.getMessage(), topicKey),
-                            "Ошибка планирования UI");
+                            "Ошибка планирования UI",
+                            "LOCATOR_NOT_FOUND");
                     return new RunnerOutcome(new ExecutionOutcome(
                             tc.id(), tc.sourceFilename(),
                             "NEEDS_CLARIFICATION", "Прервано на шаге " + (i + 1), enrichments),
@@ -152,11 +201,27 @@ public class TestCaseRunnerService {
                     return skipped(tc, enrichments, i, "ответ по теме был, но шаг не выполнен");
                 }
                 Clarification c = new Clarification(tc.id(), i,
-                        withTopic(plan.question(), topicKey), plan.reason());
+                        withTopic(plan.question(), topicKey), plan.reason(),
+                        "DATA_MISSING");
                 return new RunnerOutcome(new ExecutionOutcome(
                         tc.id(), tc.sourceFilename(),
                         "NEEDS_CLARIFICATION", "Прервано на шаге " + (i + 1), enrichments),
                         List.of(c), false);
+            }
+
+            // PATCH (P0): API-кейс не должен содержать UI-операций.
+            String op = plan.operation() == null ? "" : plan.operation().toLowerCase();
+            if (UI_OPS.contains(op)) {
+                return new RunnerOutcome(new ExecutionOutcome(
+                        tc.id(), tc.sourceFilename(), "FAILED",
+                        "Шаг " + (i + 1) + ": API-кейс требует UI-операцию '" + op + "'",
+                        enrichments), List.of(), false);
+            }
+            if (!API_OPS.contains(op)) {
+                return new RunnerOutcome(new ExecutionOutcome(
+                        tc.id(), tc.sourceFilename(), "FAILED",
+                        "Шаг " + (i + 1) + ": неизвестная API-операция '" + op + "'",
+                        enrichments), List.of(), false);
             }
 
             try {
@@ -179,7 +244,8 @@ public class TestCaseRunnerService {
                 }
                 Clarification c = new Clarification(tc.id(), i,
                         withTopic("Шаг " + (i + 1) + " («" + step + "»): " + ex.getMessage(), topicKey),
-                        "Ошибка планирования API");
+                        "Ошибка планирования API",
+                        "DATA_MISSING");
                 return new RunnerOutcome(new ExecutionOutcome(
                         tc.id(), tc.sourceFilename(),
                         "NEEDS_CLARIFICATION", "Прервано на шаге " + (i + 1), enrichments),
@@ -215,18 +281,5 @@ public class TestCaseRunnerService {
     private String withTopic(String question, String topicKey) {
         if (topicKey == null || topicKey.isBlank()) return question;
         return "[" + topicKey + "] " + (question == null ? "" : question);
-    }
-
-    private boolean isApiType(ParsedTestCase tc) {
-        if (tc.type() == null) return false;
-        String t = tc.type().trim().toUpperCase();
-        if (t.equals("API")) return true;
-        if (t.equals("NEGATIVE")) {
-            String all = String.join(" ", tc.steps()).toLowerCase();
-            return all.contains("get-запрос") || all.contains("post-запрос")
-                    || all.contains("http://") || all.contains("https://")
-                    || all.contains("http-код") || all.contains("api.");
-        }
-        return false;
     }
 }

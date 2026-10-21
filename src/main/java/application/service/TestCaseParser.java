@@ -1,6 +1,7 @@
 package application.service;
 
 import application.dto.Dtos.ParsedTestCase;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
@@ -8,13 +9,13 @@ import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+@Slf4j
 @Service
 public class TestCaseParser {
 
     private static final Pattern HEADER = Pattern.compile("^#\\s+(TC-[A-Z0-9\\-]+)\\s+[—-]\\s+(.+)$");
     private static final Pattern FIELD = Pattern.compile("^-\\s+\\*\\*([^*]+):\\*\\*\\s*(.+)$");
 
-    // find() ищет подстроку: начало строки + ссылка в любом месте
     private static final Pattern INDEX_ENTRY =
             Pattern.compile("\\[([^\\]]+)]\\(([^)]+\\.md)\\)");
 
@@ -103,7 +104,11 @@ public class TestCaseParser {
             } else if ("preconditions".equals(section)) {
                 if (line.startsWith("- ")) preconditions.add(line.substring(2).strip());
             } else if ("expected".equals(section)) {
-                if (!line.startsWith("#") && !line.startsWith("-")) {
+                // PATCH: поддержка markdown-списков в «Ожидаемый результат».
+                if (line.startsWith("- ")) {
+                    String item = line.substring(2).strip();
+                    expectedResult = expectedResult.isBlank() ? item : expectedResult + " " + item;
+                } else if (!line.startsWith("#")) {
                     expectedResult = expectedResult.isBlank() ? line : expectedResult + " " + line;
                 }
             }
@@ -113,7 +118,11 @@ public class TestCaseParser {
             throw new IllegalArgumentException("Не удалось распарсить тест-кейс: " + sourceFilename
                     + " (id=" + id + ", steps=" + steps.size() + ")");
         }
-        if (type == null) type = "UI";
+        // PATCH: не угадываем тип — помечаем INVALID, чтобы не маскировать дефект генератора.
+        if (type == null) {
+            log.warn("TC {}: не указан тип кейса, помечаю как INVALID", id);
+            type = "INVALID";
+        }
         return new ParsedTestCase(id, type, title, requirementRef, preconditions, steps,
                 expectedResult, priority, sourceFilename, markdown, List.of());
     }

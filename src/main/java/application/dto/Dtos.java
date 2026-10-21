@@ -10,12 +10,22 @@ public class Dtos {
         }
     }
 
+    // PATCH: добавлено topicKey в Answer — чтобы resolveApiBaseUrl/resolveStartUrl
+    // матчили ответы по теме, а не «любой URL из ответа».
     public record AnswerRequest(List<Answer> answers) {
-        public record Answer(String question, String answer) {
+        public record Answer(String question, String answer, String topicKey) {
         }
     }
 
-    public record Clarification(String testCaseId, Integer stepIndex, String question, String reason) {
+    // PATCH: добавлено category — агент сможет авто-переклассифицировать кейс
+    // (CASE_TYPE_MISMATCH / LOCATOR_NOT_FOUND / DATA_MISSING / UNSUPPORTED_OP).
+    public record Clarification(
+            String testCaseId,
+            Integer stepIndex,
+            String question,
+            String reason,
+            String category
+    ) {
     }
 
     public record StepEnrichment(int stepIndex, String action, String detail) {

@@ -39,9 +39,9 @@ app:
       Ответ — ТОЛЬКО валидный JSON, без markdown-обёрток.
 
       Формат ответа:
-      {"operation": "navigate|click|fill|assertText|waitForText|apiCall|assertBody|assertHeader|assertStatus|parseJson|skip|needClarification",
+      {"operation": "navigate|click|fill|assertText|waitForText|assertPageText|apiCall|assertBody|assertHeader|assertStatus|parseJson|skip|needClarification",
        "locator": "CSS-селектор (для UI) или имя заголовка (для assertHeader)",
-       "value": "значение для fill/assertText/waitForText/assertBody/assertHeader/assertStatus/navigate",
+       "value": "значение для fill/assertText/waitForText/assertPageText/assertBody/assertHeader/assertStatus/navigate",
        "method": "GET|POST|PUT|DELETE|PATCH (для apiCall)",
        "path": "/path или полный URL (для apiCall)",
        "bodyJson": "{}",
@@ -54,6 +54,19 @@ app:
        "elementName": "видимый текст элемента (до 80 символов)",
        "locatorAlternatives": "[\"#alt1\",\"#alt2\"] — 2-3 альтернативы от стабильной к хрупкой"}
 
+      ПРАВИЛО 0 (ЖЁСТКОЕ РАЗДЕЛЕНИЕ UI И API — ПРИОРИТЕТ ВЫШЕ ВСЕХ ОСТАЛЬНЫХ):
+      - Если «Тип кейса: UI» — разрешены ТОЛЬКО операции:
+        navigate, click, fill, assertText, waitForText, assertPageText, skip, needClarification.
+        Любая другая операция (apiCall, assertHeader, assertStatus, parseJson, assertBody)
+        ЗАПРЕЩЕНА. Если шаг UI-кейса требует HTTP-запроса — верни
+        needClarification с topicKey="case_type_mismatch" и
+        reason="Шаг требует API-операции, но кейс помечен как UI".
+      - Если «Тип кейса: API» — разрешены ТОЛЬКО операции:
+        apiCall, assertBody, assertHeader, assertStatus, parseJson, skip, needClarification.
+        Любая UI-операция (navigate, click, fill, assertText, waitForText, assertPageText)
+        ЗАПРЕЩЕНА. Если шаг API-кейса требует UI-действия — верни
+        needClarification с topicKey="case_type_mismatch".
+
       ЖЁСТКИЕ ПРАВИЛА:
       1. ОБЯЗАТЕЛЬНО используй ответы пользователя из блока «Ранее пользователь ответил».
          Если ответ снимает неопределённость шага — НЕ ЗАПРАШИВАЙ уточнение повторно.
@@ -62,6 +75,12 @@ app:
       3. UI: используй ТОЛЬКО элементы, реально присутствующие в DOM-СНАПШОТЕ.
          Если подходящего элемента нет — needClarification с topicKey="ui_locator_<тема>",
          а в question перечисли 2-3 ближайших кандидата из снапшота.
+      3a. needClarification уместен ТОЛЬКО когда не хватает ДАННЫХ (URL, локатор,
+          значение), но операция допустима для типа кейса. Если операция недопустима
+          для типа — используй topicKey="case_type_mismatch".
+      3b. Если шаг содержит "GET-запрос", "POST-запрос", "curl", "HTTP", "API",
+          "/v1/", "endpoint" — это признак API-шага. В UI-кейсе такой шаг →
+          case_type_mismatch.
       4. API: если пользователь дал полный URL — верни его в поле path,
          иначе path="/...". Метод по умолчанию GET. Если ожидается код ошибки (4xx, 400),
          укажи expectedStatus=400. Если в шаге сказано "любой из 4xx", верни operation="assertStatus",
@@ -70,16 +89,16 @@ app:
          value=<URL из шага, или из ответа пользователя>.
       6. Для шага «дождаться загрузки/появления» используй operation="waitForText",
          value=<ключевой текст, который должен появиться>.
-      7. Если предыдущие шаги этого кейса уже выполнили apiCall с HTTP 200 на нужный URL,
-         а текущий шаг требует проверить наличие поля в теле ответа — верни operation="assertBody",
-         value=<имя поля или подстрока>. Не возвращай apiCall повторно и не требуй method/path.
-         operation="assertBody" доступна ТОЛЬКО для API-кейсов. Для UI-кейсов
-         используйте assertText или waitForText.
+      7. Для проверки наличия поля в теле ответа API используй operation="assertBody".
+         operation="assertBody" доступна ТОЛЬКО для API-кейсов.
+         Для UI-кейсов используйте assertText или assertPageText.
       8. Если среди ответов пользователя уже есть ответ SKIP на вопрос с той же темой
          (тот же topicKey или совпадающий reason) — верни operation="skip",
          reason="пользователь запросил пропуск".
-      9. Поле topicKey обязательно для needClarification. Это короткий ключ темы
-         (до 40 символов), например: api_base_url, ui_locator_block, coordinates.
+      9. Поле topicKey обязательно для needClarification. Это короткий ключ темы.
+         Выбирай из списка: api_base_url, start_url, ui_locator_<role>,
+         case_type_mismatch, expected_value, coordinates, auth_token.
+         Если ни один не подходит — используй "other:<краткое_описание>".
          Для одного и того же topicKey задавай уточнение только один раз в рамках кейса.
       10. Для проверки HTTP-заголовка последнего ответа используй operation="assertHeader".
           locator = имя заголовка (например Content-Type), value = ожидаемое значение.
@@ -104,7 +123,7 @@ app:
       18. elementRole + elementName — для генерации getByRole(...) в Java.
       19. Для проверки наличия текста на странице используй assertText с locator,
           указывающим на конкретный блок (pre, code, section), НЕ на "body".
-          Исключение: если в шаге явно нужен весь текст страницы.
+          Исключение: если в шаге явно нужен весь текст страницы — assertPageText.
       20. ВНУТРИ CSS-СЕЛЕКТОРА для :has-text(...) и подобных псевдоклассов
           используй ТОЛЬКО ОДИНАРНЫЕ кавычки: `pre:has-text('curl')`.
           Двойные кавычки ломают JSON-экранирование и Java-строки.

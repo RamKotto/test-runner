@@ -171,20 +171,22 @@ public class UiExecutor {
                 return new StepEnrichment(stepIndex, "waitForText",
                         "waitForText\n   • expected: `" + expected + "`");
             }
-            case "assertBody": {
+            // PATCH: переименовано assertBody → assertPageText (устранена коллизия с API).
+            case "assertPageText": {
                 String expected = plan.value();
                 if (expected == null || expected.isBlank()) {
-                    throw new LocatorNotResolved("не указан ожидаемый текст для assertBody");
+                    throw new LocatorNotResolved("не указан ожидаемый текст для assertPageText");
                 }
                 String actual = page.locator("body").innerText();
                 if (!actual.contains(expected)) {
                     throw new AssertionFailure("текст в body не содержит `" + expected + "`");
                 }
-                return new StepEnrichment(stepIndex, "assertBody",
-                        "assertBody\n   • expected: `" + expected + "`");
+                return new StepEnrichment(stepIndex, "assertPageText",
+                        "assertPageText\n   • expected: `" + expected + "`");
             }
             default:
-                throw new LocatorNotResolved("неподдерживаемая UI-операция: " + plan.operation());
+                // PATCH: семантически правильное исключение — это дефект плана, не «локатор».
+                throw new UnsupportedUiOperation(plan.operation());
         }
     }
 
@@ -607,6 +609,13 @@ public class UiExecutor {
     public static final class LocatorNotResolved extends RuntimeException {
         public LocatorNotResolved(String message) {
             super(message);
+        }
+    }
+
+    // PATCH: отдельное исключение для неподдерживаемой операции — не путать с «локатор не найден».
+    public static final class UnsupportedUiOperation extends RuntimeException {
+        public UnsupportedUiOperation(String op) {
+            super("UIExecutor не поддерживает операцию: " + op);
         }
     }
 }

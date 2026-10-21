@@ -4,6 +4,7 @@ import application.config.AppProperties;
 import application.dto.Dtos.AnswerRequest;
 import application.dto.Dtos.ParsedTestCase;
 import application.dto.Dtos.StepEnrichment;
+import application.exception.GenerationException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -12,11 +13,18 @@ import org.springframework.stereotype.Service;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class StepPlanner {
+
+    // PATCH: коллизия assertBody устранена — для UI теперь assertPageText.
+    private static final Set<String> UI_OPS = Set.of(
+            "navigate", "click", "fill", "asserttext", "waitfortext", "assertpagetext");
+    private static final Set<String> API_OPS = Set.of(
+            "apicall", "assertbody", "assertheader", "assertstatus", "parsejson");
 
     private final OpenRouterClient openRouter;
     private final AppProperties appProps;
@@ -37,17 +45,24 @@ public class StepPlanner {
 
         public boolean isUiOperation() {
             String op = operation == null ? "" : operation.toLowerCase();
-            return switch (op) {
-                case "navigate", "click", "fill", "asserttext", "waitfortext", "assertbody" -> true;
-                default -> false;
-            };
+            return UI_OPS.contains(op);
+        }
+
+        // PATCH: валидация плана против типа кейса. Вызывается из planStep.
+        public Plan validateAgainst(String caseType) {
+            if (isSkip() || needsClarification()) return this;
+            String op = operation == null ? "" : operation.toLowerCase();
+            boolean apiCase = "API".equalsIgnoreCase(caseType);
+            Set<String> allowed = apiCase ? API_OPS : UI_OPS;
+            if (!allowed.contains(op)) {
+                throw new GenerationException(
+                        "План не соответствует типу кейса (" + caseType + "): operation=" + op
+                                + ". Разрешены: " + allowed);
+            }
+            return this;
         }
     }
 
-    /**
-     * @param domSnapshot компактный DOM-снапшот интерактивных элементов
-     *                    (см. UiExecutor.snapshotForPlanning)
-     */
     public Plan planStep(ParsedTestCase tc, int stepIndex, String stepText, String domSnapshot,
                          String apiBaseUrl, List<StepEnrichment> previousEnrichments,
                          String lastResponseBody, Map<String, String> lastResponseHeaders,
@@ -107,18 +122,31 @@ public class StepPlanner {
         try {
             Map<String, Object> map = mapper.readValue(cleaned, new TypeReference<>() {
             });
-            return new Plan(
+            Plan plan = new Plan(
                     str(map.get("operation")), str(map.get("locator")), str(map.get("value")),
                     str(map.get("method")), str(map.get("path")), str(map.get("bodyJson")),
-                    map.get("expectedStatus") instanceof Number n ? n.intValue() : null,
+                    parseExpectedStatus(map.get("expectedStatus")),
                     str(map.get("topicKey")), str(map.get("question")), str(map.get("reason")),
                     str(map.get("locatorStrategy")), str(map.get("elementRole")),
                     str(map.get("elementName")), str(map.get("locatorAlternatives"))
             );
+            // PATCH (P1): валидация плана прямо здесь — до executor.
+            return plan.validateAgainst(tc.type());
+        } catch (GenerationException e) {
+            throw e;
         } catch (Exception e) {
-            throw new application.exception.GenerationException(
+            throw new GenerationException(
                     "Модель вернула невалидный JSON: " + e.getMessage(), e);
         }
+    }
+
+    // PATCH: принимаем и число, и строку из 3 цифр.
+    private static Integer parseExpectedStatus(Object raw) {
+        if (raw == null) return null;
+        if (raw instanceof Number n) return n.intValue();
+        if (raw instanceof String s && s.matches("\\d{3}")) return Integer.parseInt(s);
+        throw new GenerationException(
+                "expectedStatus должен быть числом из 3 цифр, получено: " + raw);
     }
 
     private static String str(Object o) {
