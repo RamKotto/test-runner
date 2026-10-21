@@ -34,7 +34,6 @@ public class OpenRouterClient {
         ));
         body.put("max_tokens", props.getMaxOutputTokens());
         body.put("response_format", Map.of("type", "json_object"));
-        // Haiku 5.5: temperature не принимается, управляем через reasoning.effort
         body.put("reasoning", Map.of("effort", "high"));
 
         try {
