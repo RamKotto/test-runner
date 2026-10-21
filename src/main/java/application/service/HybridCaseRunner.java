@@ -38,13 +38,11 @@ public class HybridCaseRunner {
         String type = tc.type() == null ? "UI" : tc.type().trim().toUpperCase();
         boolean allowUi = !"API".equals(type);
         boolean allowApi = !"UI".equals(type);
-        // INVALID сюда не доходит — отсеивается в TestCaseRunnerService.
 
         List<StepEnrichment> enrichments = new ArrayList<>();
         List<String> failures = new ArrayList<>();
         List<Clarification> clarifications = new ArrayList<>();
 
-        // Общий REST-контекст между шагами.
         String lastBody = null;
         Map<String, String> lastHeaders = new LinkedHashMap<>();
         Integer lastStatus = null;
@@ -128,11 +126,10 @@ public class HybridCaseRunner {
                                     "⏭ SKIP по ответу (topic=" + topicKey + "): " + lnr.getMessage()));
                             continue;
                         }
-                        Clarification c = new Clarification(tc.id(), i,
+                        clarifications.add(new Clarification(tc.id(), i,
                                 withTopic("Шаг " + (i + 1) + " («" + step + "»): "
                                         + lnr.getMessage(), topicKey),
-                                "Ошибка планирования UI", "LOCATOR_NOT_FOUND");
-                        clarifications.add(c);
+                                "Ошибка планирования UI", "LOCATOR_NOT_FOUND"));
                         return new Result(new ExecutionOutcome(
                                 tc.id(), tc.sourceFilename(), "NEEDS_CLARIFICATION",
                                 "Прервано на шаге " + (i + 1), enrichments),
@@ -157,12 +154,40 @@ public class HybridCaseRunner {
                             lastHeaders = r.responseHeaders();
                         if (r.responseStatusCode() != null) lastStatus = r.responseStatusCode();
                     } catch (AssertionFailure af) {
+                        // Правка C: конфиг-ошибка на apiCall (неверный/недоступный base URL,
+                        // unknown protocol, connection refused) — это missing data,
+                        // а не FAILED. Возвращаем needClarification(api_base_url).
+                        if ("apicall".equals(op) && isConfigError(af.getMessage())) {
+                            String topicKey = "api_base_url";
+                            if (isSkippedInThisCase(tc, topicKey)
+                                    || findAnswerInThisCase(tc, topicKey) != null) {
+                                enrichments.add(new StepEnrichment(i, "skip",
+                                        "⏭ SKIP по ответу (topic=" + topicKey + "): "
+                                                + af.getMessage()));
+                                continue;
+                            }
+                            clarifications.add(new Clarification(tc.id(), i,
+                                    withTopic("Шаг " + (i + 1) + " («" + step + "»): "
+                                            + af.getMessage(), topicKey),
+                                    "Не задан/недоступен API base URL", "DATA_MISSING"));
+                            return new Result(new ExecutionOutcome(
+                                    tc.id(), tc.sourceFilename(), "NEEDS_CLARIFICATION",
+                                    "Прервано на шаге " + (i + 1), enrichments),
+                                    clarifications);
+                        }
                         enrichments.add(new StepEnrichment(i, op, "❌ " + af.getMessage()));
                         failures.add("Шаг " + (i + 1) + ": " + af.getMessage());
-                        // После assertStatus FAILED REST-контекст сохраняем:
-                        // следующие шаги могут зависеть от ответа.
                     } catch (UiExecutor.LocatorNotResolved lnr) {
                         String topicKey = normalizeTopic(plan.topicKey(), lnr.getMessage());
+                        // Правка A: LocatorNotResolved от buildFullUrl содержит api_base_url-подсказку;
+                        // уважаем topicKey из плана, если модель его дала.
+                        if (topicKey == null || topicKey.isBlank()
+                                || "clarification".equals(topicKey)) {
+                            if (lnr.getMessage() != null
+                                    && lnr.getMessage().toLowerCase().contains("api_base_url")) {
+                                topicKey = "api_base_url";
+                            }
+                        }
                         if (isSkippedInThisCase(tc, topicKey)
                                 || findAnswerInThisCase(tc, topicKey) != null) {
                             enrichments.add(new StepEnrichment(i, "skip",
@@ -208,6 +233,25 @@ public class HybridCaseRunner {
                 }
             }
         }
+    }
+
+    /**
+     * Правка C: распознаём конфиг-ошибки apiCall, которые должны стать
+     * needClarification(api_base_url), а не FAILED.
+     */
+    private static boolean isConfigError(String msg) {
+        if (msg == null) return false;
+        String m = msg.toLowerCase();
+        return m.contains("unknown protocol")
+                || m.contains("api_base_url")
+                || m.contains("api base url")
+                || m.contains("unknown host")
+                || m.contains("connection refused")
+                || m.contains("connect timed out")
+                || m.contains("connection timed out")
+                || m.contains("не отвечает")
+                || m.contains("некорректный абсолютный url")
+                || m.contains("не задан корректный apibaseurl");
     }
 
     private String resolveStartUrl(ParsedTestCase tc, String fallback) {

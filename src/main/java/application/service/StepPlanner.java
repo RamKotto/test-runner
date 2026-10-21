@@ -162,8 +162,23 @@ public class StepPlanner {
             user.append(domSnapshot.length() > 40000 ? domSnapshot.substring(0, 40000) : domSnapshot)
                     .append("\n");
         }
-        if (apiBaseUrl != null && !apiBaseUrl.isBlank()) {
+
+        // Правка B: явный контракт по apiBaseUrl + path.
+        if (apiBaseUrl == null || apiBaseUrl.isBlank()) {
+            user.append("\nAPI base URL НЕ ЗАДАН. ");
+            user.append("Если шаг требует HTTP-запроса, верни needClarification ")
+                    .append("с topicKey=\"api_base_url\" и question=\"Укажите базовый URL API ")
+                    .append("(например, https://api.open-meteo.com)\", ")
+                    .append("reason=\"apiBaseUrl не передан в RunRequest\". ")
+                    .append("НЕ возвращай относительный path без base — это приведёт к ошибке.\n");
+        } else {
             user.append("\nAPI base URL: ").append(apiBaseUrl);
+            user.append("\nПравила склейки path с base URL:");
+            user.append("\n  • Если path относительный (начинается с /), он будет склеен с этим base URL.");
+            user.append("\n  • Если шаг требует ДРУГОЙ хост (например, api.open-meteo.com вместо ")
+                    .append(apiBaseUrl).append("), верни path с полным URL http(s)://...");
+            user.append("\n  • Нельзя возвращать относительный path, если apiBaseUrl не подходит ")
+                    .append("по хосту — либо полный URL в path, либо needClarification(api_base_url).\n");
         }
 
         if (lastStatusCode != null)

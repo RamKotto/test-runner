@@ -165,17 +165,26 @@ public class ApiExecutor {
         if (method.isEmpty()) method = "GET";
         String path = plan.path();
 
+        // Правка A: падаем LocatorNotResolved ДО RestAssured, если URL не абсолютный
+        // и apiBaseUrl отсутствует/невалиден. Это уходит в needClarification(api_base_url).
         String fullUrl = buildFullUrl(apiBaseUrl, path);
-        if (fullUrl == null || fullUrl.isBlank()) {
-            throw new UiExecutor.LocatorNotResolved("не указан apiBaseUrl и path");
-        }
+
         URI uri;
         try {
             uri = URI.create(fullUrl);
         } catch (IllegalArgumentException e) {
             throw new UiExecutor.LocatorNotResolved("некорректный URL API: " + fullUrl);
         }
-        String baseUri = uri.getScheme() + "://" + uri.getHost()
+        String scheme = uri.getScheme();
+        String host = uri.getHost();
+        if (scheme == null || host == null
+                || !(scheme.equalsIgnoreCase("http") || scheme.equalsIgnoreCase("https"))) {
+            throw new UiExecutor.LocatorNotResolved(
+                    "некорректный абсолютный URL API (нужен http(s)://host/...): `"
+                            + fullUrl + "`. Проверьте apiBaseUrl в RunRequest или path в плане.");
+        }
+
+        String baseUri = scheme + "://" + host
                 + (uri.getPort() > 0 ? ":" + uri.getPort() : "");
         String uriPath = uri.getRawPath();
         if (uriPath == null || uriPath.isEmpty()) uriPath = "/";
@@ -183,7 +192,6 @@ public class ApiExecutor {
 
         Map<String, String> effectiveHeaders = new LinkedHashMap<>();
         if (headers != null) effectiveHeaders.putAll(headers);
-        // merge requestHeaders из плана (простой парсинг "K: V\nK2: V2")
         Map<String, String> planHeaders = parseHeaders(plan.requestHeaders());
         effectiveHeaders.putAll(planHeaders);
         String bodyJson = plan.bodyJson();
@@ -363,18 +371,28 @@ public class ApiExecutor {
         return null;
     }
 
+    /**
+     * Правка A: собираем абсолютный URL. Если path относительный, а apiBaseUrl
+     * отсутствует/невалиден — бросаем LocatorNotResolved (→ needClarification),
+     * чтобы НЕ доходить до RestAssured с "null://null" и не получать
+     * "unknown protocol: null" как FAILED.
+     */
     private String buildFullUrl(String apiBaseUrl, String path) {
-        if (path != null && (path.startsWith("http://") || path.startsWith("https://"))) return path;
-        if ((path == null || path.isBlank()) && apiBaseUrl != null
-                && (apiBaseUrl.startsWith("http://") || apiBaseUrl.startsWith("https://")))
-            return apiBaseUrl;
-        if (apiBaseUrl != null && path != null) {
-            if (apiBaseUrl.endsWith("/") && path.startsWith("/"))
-                return apiBaseUrl.substring(0, apiBaseUrl.length() - 1) + path;
-            if (!apiBaseUrl.endsWith("/") && !path.startsWith("/")) return apiBaseUrl + "/" + path;
-            return apiBaseUrl + path;
+        if (path != null && (path.startsWith("http://") || path.startsWith("https://"))) {
+            return path;
         }
-        return null;
+        if (apiBaseUrl == null || apiBaseUrl.isBlank()
+                || !(apiBaseUrl.startsWith("http://") || apiBaseUrl.startsWith("https://"))) {
+            throw new UiExecutor.LocatorNotResolved(
+                    "не задан корректный apiBaseUrl (нужен http(s)://host/...), "
+                            + "а path=`" + path + "` относительный. "
+                            + "Укажите apiBaseUrl в RunRequest или ответьте на уточнение "
+                            + "с topicKey=api_base_url.");
+        }
+        String base = apiBaseUrl.endsWith("/")
+                ? apiBaseUrl.substring(0, apiBaseUrl.length() - 1) : apiBaseUrl;
+        String p = path == null ? "" : (path.startsWith("/") ? path : "/" + path);
+        return base + p;
     }
 
     private static void sleepQuietly(long ms) {
