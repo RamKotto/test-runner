@@ -352,8 +352,9 @@ public class ApiExecutor {
     }
 
     /**
-     * Снимок JSON-значения по JSONPath {@code plan.jsonPath()} в named-слот
-     * {@code plan.snapshotKey()}. Требует тело предыдущего ответа ({@code lastResponseBody}).
+     * Снимок JSON-значения по JSONPath/JSON Pointer {@code plan.jsonPath()}
+     * в named-слот {@code plan.snapshotKey()}.
+     * Требует тело предыдущего ответа ({@code lastResponseBody}).
      */
     public SnapshotResult snapshotApiValue(int stepIndex, StepPlanner.Plan plan,
                                            String lastResponseBody) {
@@ -361,7 +362,7 @@ public class ApiExecutor {
         String path = plan.jsonPath();
         if (path == null || path.isBlank()) {
             throw new UiExecutor.LocatorNotResolved(
-                    "snapshotApiValue: не указан jsonPath (напр. `$.hourly.temperature_2m`)");
+                    "snapshotApiValue: не указан jsonPath (напр. `/hourly/temperature_2m` или `$.hourly.temperature_2m`)");
         }
         if (lastResponseBody == null || lastResponseBody.isBlank()) {
             throw new AssertionFailure("snapshotApiValue: нет тела предыдущего ответа"
@@ -373,18 +374,20 @@ public class ApiExecutor {
         } catch (Exception e) {
             throw new AssertionFailure("snapshotApiValue: невалидный JSON: " + e.getMessage());
         }
-        JsonNode slice = root.at(path);
+        String pointer = toJsonPointer(path);
+        JsonNode slice = root.at(pointer);
         if (slice.isMissingNode()) {
             throw new AssertionFailure("snapshotApiValue: jsonPath `" + path
-                    + "` не найден в теле ответа");
+                    + "` (→ `" + pointer + "`) не найден в теле ответа");
         }
         String canonical = canonicalize(slice);
         String preview = truncate(canonical, 240);
-        String detail = "snapshotApiValue → snapshot[" + key + "] ← `" + path + "`\n"
-                + "   • length: " + canonical.length() + " chars\n"
+        String detail = "snapshotApiValue → snapshot[" + key + "] ← `" + path
+                + "`" + (path.equals(pointer) ? "" : " (→ `" + pointer + "`)")
+                + "\n   • length: " + canonical.length() + " chars\n"
                 + "   • preview: " + preview;
-        log.info("API-шаг {}: snapshotApiValue key={} path={} len={}",
-                stepIndex + 1, key, path, canonical.length());
+        log.info("API-шаг {}: snapshotApiValue key={} path={} pointer={} len={}",
+                stepIndex + 1, key, path, pointer, canonical.length());
         return new SnapshotResult(
                 StepEnrichment.api(stepIndex, "snapshotApiValue", detail, null, null, null),
                 key, canonical);
@@ -417,10 +420,11 @@ public class ApiExecutor {
         } catch (Exception e) {
             throw new AssertionFailure("assertApiValueEqualsSnapshot: невалидный JSON");
         }
-        JsonNode actualSlice = root.at(path);
+        String pointer = toJsonPointer(path);
+        JsonNode actualSlice = root.at(pointer);
         if (actualSlice.isMissingNode()) {
             throw new AssertionFailure("assertApiValueEqualsSnapshot: jsonPath `" + path
-                    + "` отсутствует в текущем ответе");
+                    + "` (→ `" + pointer + "`) отсутствует в текущем ответе");
         }
         String actual = canonicalize(actualSlice);
         boolean equals = reference.equals(actual);
@@ -428,6 +432,7 @@ public class ApiExecutor {
         StringBuilder detail = new StringBuilder("assertApiValueEqualsSnapshot")
                 .append("\n   • snapshotKey: `").append(key).append("`")
                 .append("\n   • jsonPath: `").append(path).append("`")
+                .append(path.equals(pointer) ? "" : " (→ `" + pointer + "`)")
                 .append("\n   • expected length: ").append(reference.length())
                 .append("\n   • actual length: ").append(actual.length())
                 .append("\n   • ").append(equals ? "✅ equal" : "❌ differ");
@@ -447,6 +452,26 @@ public class ApiExecutor {
     }
 
     // ---- helpers ----
+
+    /**
+     * Приводит путь к формату RFC 6901 (JSON Pointer).
+     * Принимает: "/hourly/temperature_2m", "$.hourly.temperature_2m", "$", "".
+     * Возвращает: "/hourly/temperature_2m", "/", "/".
+     */
+    private static String toJsonPointer(String raw) {
+        if (raw == null || raw.isBlank()) return "/";
+        String s = raw.trim();
+        if (s.startsWith("$")) {
+            s = s.substring(1);
+            if (s.isEmpty()) return "/";
+            if (s.startsWith(".")) s = s.substring(1);
+            s = s.replace('.', '/');
+            if (!s.startsWith("/")) s = "/" + s;
+        }
+        if (s.isEmpty()) return "/";
+        if (!s.startsWith("/")) s = "/" + s;
+        return s;
+    }
 
     private static String canonicalize(JsonNode node) {
         if (node == null) return "null";

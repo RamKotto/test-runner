@@ -44,11 +44,6 @@ public class HybridCaseRunner {
     ) {
     }
 
-    /**
-     * Результат выполнения одной API-операции.
-     * apiResult != null только для apiCall — остальные операции
-     * не меняют lastBody/lastHeaders/lastStatus.
-     */
     private record ApiOpResult(StepEnrichment enrichment,
                                ApiExecutor.ApiStepResult apiResult) {
     }
@@ -326,17 +321,13 @@ public class HybridCaseRunner {
      * а в БУДУЩИХ шагах упоминается сравнение («сравнить», «идентичны»,
      * «оба ответа» и т.д.), и модель забыла snapshotApiValue — добавляем
      * snapshotApiValue программно.
-     * <p>
-     * Это страховка на случай недетерминизма LLM: ПРАВИЛО 8.1 в промпте
-     * просит модель снимать snapshot сама, а этот метод гарантирует,
-     * что снимок будет снят.
      */
     private List<StepPlanner.Plan> maybeAddSnapshotForFutureCompare(
             List<StepPlanner.Plan> plans, ParsedTestCase tc, int currentStep) {
         if (plans == null || plans.isEmpty()) return plans;
 
         String type = tc.type() == null ? "" : tc.type().trim().toUpperCase();
-        if ("UI".equals(type)) return plans; // только для API/гибридных
+        if ("UI".equals(type)) return plans;
 
         boolean hasApiCall = plans.stream()
                 .anyMatch(p -> "apicall".equalsIgnoreCase(p.operation()));
@@ -371,15 +362,19 @@ public class HybridCaseRunner {
         return false;
     }
 
+    /**
+     * Возвращает путь в формате JSON Pointer (RFC 6901), напр. "/hourly/temperature_2m".
+     * ApiExecutor дополнительно нормализует "$.hourly.temperature_2m" в тот же вид.
+     */
     private String guessJsonPath(List<String> steps, int currentStep) {
-        if (steps == null) return "$";
+        if (steps == null) return "/";
         for (int j = currentStep + 1; j < steps.size(); j++) {
             Matcher m = JSON_PATH_HINT.matcher(steps.get(j));
             if (m.find()) {
-                return "$." + m.group(1);
+                return "/" + m.group(1).replace('.', '/');
             }
         }
-        return "$";
+        return "/";
     }
 
     private record StartUrlOutcome(String url, boolean isSkip, Clarification clarification) {

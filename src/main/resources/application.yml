@@ -66,7 +66,7 @@ app:
         "elementName": "видимый текст элемента (до 80 символов)",
         "locatorAlternatives": "[\"#alt1\",\"#alt2\"]",
         "snapshotKey": "уникальное имя слота для snapshot/compare",
-        "jsonPath": "$.path.to.value (только для snapshotApiValue/assertApiValueEqualsSnapshot)",
+        "jsonPath": "RFC 6901 JSON Pointer, напр. /hourly/temperature_2m (можно $.hourly.temperature_2m — сервер нормализует)",
         "attribute": "innerText|textContent|value|href|src|<attr> (только для snapshotUiText/assertUiTextEqualsSnapshot)"
       }
 
@@ -193,10 +193,10 @@ app:
       Для API:
       1) На шаге-эталоне (N): operation="snapshotApiValue",
          snapshotKey="<уникальное имя, напр. temp_hourly>",
-         jsonPath="$.hourly.temperature_2m" (JSONPath к сравниваемому узлу).
+         jsonPath="/hourly/temperature_2m" (JSON Pointer, RFC 6901).
       2) На шаге-сравнении (M): operation="assertApiValueEqualsSnapshot",
          snapshotKey="<то же имя>",
-         jsonPath="$.hourly.temperature_2m" (тот же путь).
+         jsonPath="/hourly/temperature_2m" (тот же путь).
 
       Для UI:
       1) На шаге-эталоне: operation="snapshotUiText",
@@ -212,8 +212,11 @@ app:
       ПРАВИЛА СРАВНЕНИЯ:
       - snapshotKey — короткий snake_case, уникальный в пределах кейса.
         На одном шаге можно снять несколько снимков (верни массив plans).
-      - jsonPath — синтаксис Jackson JsonNode.at() (например: $.current.temperature_2m,
-        $.hourly.temperature_2m, $.data[0].value).
+      - jsonPath — RFC 6901 JSON Pointer, напр. /hourly/temperature_2m, /current/temperature_2m,
+        /data/0/value. Допустим формат JSONPath ($.hourly.temperature_2m) — сервер
+        нормализует в JSON Pointer.
+      - НЕ используй "$" (корень) для сравнения всего тела — поля вроде generationtime_ms
+        или current.time меняются между запросами. Указывай КОНКРЕТНЫЙ узел.
       - Если шаг требует сравнения, но операция snapshot на эталоне ещё НЕ выполнялась —
         верни needClarification с topicKey="expected_value" и попроси выполнить
         сначала шаг-эталон.
@@ -224,19 +227,21 @@ app:
 
       ПРАВИЛО 8.1 (СНИМОК СРАЗУ ПРИ ВЫПОЛНЕНИИ ЭТАЛОНА):
       - ВСЕГДА, когда ты возвращаешь apiCall, проверь текст ТЕКУЩЕГО шага и ВСЕ последующие
-        шаги кейса (они даны в "Шаг #N: ..."). Если в каком-либо БУДУЩЕМ шаге упоминается
+        шаги кейса (они даны в "Последующие шаги"). Если в каком-либо БУДУЩЕМ шаге упоминается
         сравнение («сравнить», «идентичны», «не изменились», «совпадают») или присутствует
         ссылка на «оба ответа», «значения из ответа шага N» — ты ОБЯЗАН в этом же массиве
         plans вернуть ДОПОЛНИТЕЛЬНЫЙ план:
            { "operation": "snapshotApiValue",
              "snapshotKey": "<snake_case>",
-             "jsonPath": "<путь к узлу>" }
+             "jsonPath": "/<путь к конкретному узлу>" }
         Снимок нужно делать СРАЗУ, потому что на шаге сравнения тела предыдущего ответа
         уже не будет (там будет тело текущего ответа).
+      - Если не уверен, какой именно узел сравнивается (например, «все значения»),
+        посмотри текст будущего шага: если там есть «hourly.temperature_2m» — используй
+        /hourly/temperature_2m. Если там общее сравнение «ответы идентичны» — используй "/"
+        (корень), но помни, что поля generationtime_ms/current.time нестабильны.
       - То же правило для UI: если в будущем шаге есть сравнение, и текущий шаг —
         navigate/click/fill — добавь snapshotUiText на нужном элементе.
-      - Если не уверен, какой именно узел сравнивается (например, «все значения»),
-        сними снимок с корня ответа: jsonPath="$" — сравнение покажет полное совпадение.
 
 openrouter:
   base-url: https://openrouter.ai/api/v1
