@@ -153,7 +153,7 @@ public class StepPlanner {
             for (StepEnrichment e : previousEnrichments) {
                 user.append("- Шаг ").append(e.stepIndex() + 1)
                         .append(": ").append(e.action()).append(" → ")
-                        .append(truncate(e.detail(), 500)).append("\n");
+                        .append(e.detail()).append("\n");
             }
             user.append("\nДля проверки тела используй assertBody, отсутствия подстроки — ")
                     .append("assertBodyAbsent, заголовка — assertHeader, отсутствия заголовка — ")
@@ -161,9 +161,8 @@ public class StepPlanner {
         }
 
         if (domSnapshot != null && !domSnapshot.isBlank()) {
-            user.append("DOM-СНАПШОТ страницы (только интерактивные элементы с атрибутами):\n");
-            user.append(domSnapshot.length() > 40000 ? domSnapshot.substring(0, 40000) : domSnapshot)
-                    .append("\n");
+            user.append("DOM-СНАПШОТ страницы (полный, только интерактивные элементы с атрибутами):\n");
+            user.append(domSnapshot).append("\n");
         }
 
         if (apiBaseUrl == null || apiBaseUrl.isBlank()) {
@@ -192,13 +191,21 @@ public class StepPlanner {
             }
         }
         if (lastResponseBody != null && !lastResponseBody.isBlank()) {
-            user.append("\nТело последнего ответа API:\n")
-                    .append(lastResponseBody.length() > 12000
-                            ? lastResponseBody.substring(0, 12000) : lastResponseBody)
-                    .append("\n");
+            user.append("\nТело последнего ответа API (полное):\n")
+                    .append(lastResponseBody).append("\n");
         }
 
-        String response = openRouter.complete(appProps.getPrompts().getPlanStep(), user.toString());
+        String userText = user.toString();
+        int maxInputChars = appProps.getPlanner().getMaxInputChars();
+        if (maxInputChars > 0 && userText.length() > maxInputChars) {
+            throw new PlannerInputTooLargeException(
+                    "Вход планера слишком большой: " + userText.length()
+                            + " символов (лимит " + maxInputChars + "). "
+                            + "Сузьте startUrl (конкретная страница/раздел) или укажите "
+                            + "селектор контейнера в ответе на уточнение.");
+        }
+
+        String response = openRouter.complete(appProps.getPrompts().getPlanStep(), userText);
         String cleaned = response.replaceAll("^```json\\s*", "").replaceAll("```\\s*$", "").trim();
         try {
             Map<String, Object> map = mapper.readValue(cleaned, new TypeReference<>() {
@@ -258,8 +265,13 @@ public class StepPlanner {
         return o == null ? null : o.toString();
     }
 
-    private static String truncate(String s, int max) {
-        if (s == null) return "";
-        return s.length() <= max ? s : s.substring(0, max) + "…";
+    /**
+     * Сигнал о переполнении входа планера — конвертируется HybridCaseRunner
+     * в needClarification с topicKey="context_overflow".
+     */
+    public static final class PlannerInputTooLargeException extends RuntimeException {
+        public PlannerInputTooLargeException(String message) {
+            super(message);
+        }
     }
 }

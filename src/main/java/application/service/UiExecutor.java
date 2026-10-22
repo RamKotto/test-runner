@@ -44,13 +44,16 @@ public class UiExecutor {
         return new UiSession(ctx, page);
     }
 
+    /**
+     * Полный DOM-снапшот без обрезки по количеству элементов, длине текста и классу.
+     * Дедупликация убрана намеренно: две кнопки «Сохранить» должны попасть в снапшот
+     * обе, чтобы агент мог запросить уточнение по неоднозначности.
+     */
     public String snapshotForPlanning(UiSession session) {
         try {
             return (String) session.page().evaluate("""
                         () => {
-                            const MAX = 1500;
                             const out = [];
-                            const seen = new Set();
                             const interesting = new Set([
                                 'A','BUTTON','INPUT','SELECT','TEXTAREA','FORM','LABEL',
                                 'H1','H2','H3','H4','H5','H6','TABLE','THEAD','TBODY','TR','TD','TH',
@@ -58,7 +61,6 @@ public class UiExecutor {
                             ]);
                             const walk = (el, depth) => {
                                 if (!el || el.nodeType !== 1) return;
-                                if (out.length >= MAX) return;
                                 const tag = el.tagName;
                                 const role = el.getAttribute('role');
                                 const testid = el.getAttribute('data-testid')
@@ -86,11 +88,9 @@ public class UiExecutor {
                                     || (cls && /btn|button|link|input|card|nav|menu|modal|form|code|pre/i.test(cls));
                                 let text = '';
                                 if (isInteresting) {
-                                    text = (el.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 300);
+                                    text = (el.innerText || '').trim().replace(/\\s+/g, ' ');
                                 }
-                                const key = tag + '|' + (id||'') + '|' + (testid||'') + '|' + text;
-                                if (isInteresting && !seen.has(key)) {
-                                    seen.add(key);
+                                if (isInteresting) {
                                     const attrs = [];
                                     if (id) attrs.push('#' + id);
                                     if (testid) attrs.push('data-testid="' + testid + '"');
@@ -103,11 +103,11 @@ public class UiExecutor {
                                     if (type) attrs.push('type="' + type + '"');
                                     if (href) attrs.push('href="' + href + '"');
                                     if (placeholder) attrs.push('placeholder="' + placeholder + '"');
-                                    if (value !== null) attrs.push('value="' + String(value).slice(0, 120) + '"');
+                                    if (value !== null) attrs.push('value="' + String(value) + '"');
                                     if (checked !== null) attrs.push('checked="' + checked + '"');
                                     if (selected !== null) attrs.push('selected="' + selected + '"');
                                     if (disabled !== null) attrs.push('disabled');
-                                    if (cls) attrs.push('class="' + cls.slice(0, 100) + '"');
+                                    if (cls) attrs.push('class="' + cls + '"');
                                     out.push(' '.repeat(depth) + '<' + tag.toLowerCase()
                                         + (attrs.length ? ' ' + attrs.join(' ') : '')
                                         + '> ' + (text ? '"' + text + '"' : ''));
@@ -138,7 +138,7 @@ public class UiExecutor {
                         "navigate\n   • url: `" + page.url() + "`", List.of());
             }
             case "click": {
-                List<ElementInfo> elements = resolveAllElements(page, plan);
+                List<ElementInfo> elements = resolveAllElements(page, plan, true);
                 StringBuilder detail = new StringBuilder("click\n");
                 for (ElementInfo el : elements) {
                     detail.append("   • element #").append(el.index() + 1).append("/")
@@ -156,7 +156,7 @@ public class UiExecutor {
             case "fill": {
                 String value = plan.value();
                 if (value == null) throw new LocatorNotResolved("не указано значение для fill");
-                List<ElementInfo> elements = resolveAllElements(page, plan);
+                List<ElementInfo> elements = resolveAllElements(page, plan, true);
                 StringBuilder detail = new StringBuilder("fill\n   • value: `")
                         .append(value).append("`\n");
                 for (ElementInfo el : elements) {
@@ -175,7 +175,7 @@ public class UiExecutor {
             case "assertText": {
                 String expected = plan.value();
                 if (expected == null) throw new LocatorNotResolved("не указан ожидаемый текст");
-                List<ElementInfo> elements = resolveAllElements(page, plan);
+                List<ElementInfo> elements = resolveAllElements(page, plan, false);
                 StringBuilder detail = new StringBuilder("assertText\n")
                         .append("   • expected: `").append(expected).append("`\n")
                         .append("   • checked ").append(elements.size()).append(" element(s)\n");
@@ -264,7 +264,14 @@ public class UiExecutor {
         }
     }
 
-    public List<ElementInfo> resolveAllElements(Page page, StepPlanner.Plan plan) {
+    /**
+     * @param strictAmbiguity true для мутирующих операций (click/fill): если локатор
+     *                        матчит несколько элементов, бросаем LocatorNotResolved
+     *                        с перечнем кандидатов — это уточнение ui_locator_<role>.
+     *                        false для assertText: проходим по всем совпадениям.
+     */
+    public List<ElementInfo> resolveAllElements(Page page, StepPlanner.Plan plan,
+                                                boolean strictAmbiguity) {
         List<StepPlanner.ElementTarget> targets = plan.effectiveElements();
         if (targets.isEmpty()) {
             throw new LocatorNotResolved("план не содержит ни одного локатора");
@@ -283,7 +290,37 @@ public class UiExecutor {
             if (count == 0) {
                 throw new LocatorNotResolved("локатор `" + t.locator() + "` не найден в DOM");
             }
-            // Если локатор матчит несколько элементов — включаем каждый.
+            if (strictAmbiguity && count > 1) {
+                // Неоднозначность: собираем кандидатов и требуем уточнения.
+                StringBuilder sb = new StringBuilder();
+                sb.append("локатор `").append(t.locator()).append("` матчит ")
+                        .append(count).append(" элементов — уточните, какой использовать:\n");
+                for (int i = 0; i < count; i++) {
+                    Locator el = loc.nth(i);
+                    String tag = safeString(evaluate(el, "e => e.tagName ? e.tagName.toLowerCase() : ''"));
+                    String testid = safeAttr(el, "data-testid");
+                    if (testid == null) testid = safeAttr(el, "data-test-id");
+                    if (testid == null) testid = safeAttr(el, "data-test");
+                    String id = safeAttr(el, "id");
+                    String role = safeAttr(el, "role");
+                    String aria = safeAttr(el, "aria-label");
+                    String text = safeString(safeInnerText(el));
+                    if (text != null) text = text.trim().replaceAll("[ \\t]+", " ");
+                    sb.append("  #").append(i + 1).append(": <").append(tag);
+                    if (id != null) sb.append(" id=\"").append(id).append("\"");
+                    if (testid != null) sb.append(" data-testid=\"").append(testid).append("\"");
+                    if (role != null) sb.append(" role=\"").append(role).append("\"");
+                    if (aria != null) sb.append(" aria-label=\"").append(aria).append("\"");
+                    sb.append(">");
+                    if (text != null && !text.isBlank()) {
+                        sb.append(" text=\"").append(truncateSmart(text, 120)).append("\"");
+                    }
+                    sb.append("\n");
+                }
+                String roleKey = t.elementRole() != null && !t.elementRole().isBlank()
+                        ? t.elementRole() : "element";
+                throw new LocatorNotResolved(sb.toString().trim(), roleKey);
+            }
             for (int i = 0; i < count; i++) {
                 Locator el = loc.nth(i);
                 String individual = count > 1
@@ -480,9 +517,24 @@ public class UiExecutor {
         }
     }
 
+    /**
+     * LocatorNotResolved с опциональным roleKey — для стабильного topicKey
+     * "ui_locator_<role>" при неоднозначности локатора.
+     */
     public static final class LocatorNotResolved extends RuntimeException {
+        private final String roleKey;
+
         public LocatorNotResolved(String message) {
+            this(message, null);
+        }
+
+        public LocatorNotResolved(String message, String roleKey) {
             super(message);
+            this.roleKey = roleKey;
+        }
+
+        public String roleKey() {
+            return roleKey;
         }
     }
 

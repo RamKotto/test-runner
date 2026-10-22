@@ -53,6 +53,21 @@ public class HybridCaseRunner {
             for (int i = fromStep; i < tc.steps().size(); i++) {
                 String step = tc.steps().get(i);
 
+                // Ленивое поднятие UI-сессии ДО планирования, чтобы агент
+                // получил полный DOM-снапшот и сам нашёл локатор.
+                if (uiSession == null && allowUi) {
+                    String resolved = resolveStartUrl(tc, startUrl);
+                    if (resolved != null && !resolved.isBlank()
+                            && !"SKIP".equalsIgnoreCase(resolved.trim())
+                            && (resolved.startsWith("http://") || resolved.startsWith("https://"))) {
+                        try {
+                            uiSession = uiExecutor.newSession(resolved);
+                        } catch (Exception ex) {
+                            log.warn("Не удалось поднять UI-сессию для {}: {}", tc.id(), ex.getMessage());
+                        }
+                    }
+                }
+
                 StepPlanner.Plan plan;
                 try {
                     String domSnapshot = uiSession != null
@@ -60,6 +75,23 @@ public class HybridCaseRunner {
                             : null;
                     plan = planner.planStep(tc, i, step, domSnapshot, apiBaseUrl,
                             enrichments, lastBody, lastHeaders, lastStatus);
+                } catch (StepPlanner.PlannerInputTooLargeException tooLarge) {
+                    String topicKey = "context_overflow";
+                    if (isSkippedInThisCase(tc, topicKey)
+                            || findAnswerInThisCase(tc, topicKey) != null) {
+                        enrichments.add(new StepEnrichment(i, "skip",
+                                "⏭ SKIP по ответу (topic=" + topicKey + "): "
+                                        + tooLarge.getMessage()));
+                        continue;
+                    }
+                    clarifications.add(new Clarification(tc.id(), i,
+                            withTopic("Шаг " + (i + 1) + " («" + step + "»): "
+                                    + tooLarge.getMessage(), topicKey),
+                            "Контекст планера переполнен", "DATA_MISSING", topicKey));
+                    return new Result(new ExecutionOutcome(
+                            tc.id(), tc.sourceFilename(), "NEEDS_CLARIFICATION",
+                            "Прервано на шаге " + (i + 1), enrichments),
+                            clarifications, i);
                 } catch (GenerationException ge) {
                     failures.add("Шаг " + (i + 1) + ": " + ge.getMessage());
                     enrichments.add(new StepEnrichment(i, "planning-error",
@@ -160,7 +192,7 @@ public class HybridCaseRunner {
                                 "❌ " + af.getMessage()));
                         failures.add("Шаг " + (i + 1) + ": " + af.getMessage());
                     } catch (UiExecutor.LocatorNotResolved lnr) {
-                        String topicKey = normalizeTopic(plan.topicKey(), lnr.getMessage());
+                        String topicKey = normalizeUiLocatorTopic(lnr, plan);
                         if (isSkippedInThisCase(tc, topicKey)
                                 || findAnswerInThisCase(tc, topicKey) != null) {
                             enrichments.add(new StepEnrichment(i, "skip",
@@ -170,7 +202,8 @@ public class HybridCaseRunner {
                         clarifications.add(new Clarification(tc.id(), i,
                                 withTopic("Шаг " + (i + 1) + " («" + step + "»): "
                                         + lnr.getMessage(), topicKey),
-                                "Ошибка планирования UI", "LOCATOR_NOT_FOUND", topicKey));
+                                "Неоднозначность/отсутствие локатора",
+                                "LOCATOR_NOT_FOUND", topicKey));
                         return new Result(new ExecutionOutcome(
                                 tc.id(), tc.sourceFilename(), "NEEDS_CLARIFICATION",
                                 "Прервано на шаге " + (i + 1), enrichments),
@@ -336,6 +369,25 @@ public class HybridCaseRunner {
             }
         }
         return null;
+    }
+
+    /**
+     * Стабильный topicKey для UI-неоднозначности: "ui_locator_<role>",
+     * где role берётся из LocatorNotResolved.roleKey() (elementRole из плана)
+     * или из плана. Если role нет — "ui_locator_element".
+     */
+    private String normalizeUiLocatorTopic(UiExecutor.LocatorNotResolved lnr,
+                                           StepPlanner.Plan plan) {
+        String role = lnr.roleKey();
+        if (role == null || role.isBlank()) {
+            role = plan.elementRole();
+        }
+        if (role == null || role.isBlank()) {
+            role = "element";
+        }
+        String norm = role.trim().toLowerCase().replaceAll("[^a-z0-9_]+", "_");
+        if (norm.isBlank()) norm = "element";
+        return "ui_locator_" + (norm.length() > 30 ? norm.substring(0, 30) : norm);
     }
 
     private String normalizeTopic(String topicKey, String reason) {

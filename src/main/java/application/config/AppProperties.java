@@ -26,6 +26,8 @@ public class AppProperties {
     private Sessions sessions = new Sessions();
     @Valid
     private Prompts prompts = new Prompts();
+    @Valid
+    private Planner planner = new Planner();
 
     /**
      * Допустимые типы тест-кейсов.
@@ -35,6 +37,7 @@ public class AppProperties {
 
     /**
      * 0 = без ограничения; иначе — максимум символов тела ответа в enrichment.
+     * НЕ влияет на планирование: планер получает полное тело.
      */
     private int enrichmentBodyLimit = 0;
 
@@ -78,5 +81,16 @@ public class AppProperties {
     public static class Prompts {
         @NotBlank
         private String planStep;
+    }
+
+    /**
+     * Настройки планировщика. maxInputChars — защита от переполнения контекста
+     * модели: при превышении возвращается needClarification(context_overflow),
+     * а не молчаливая обрезка снапшота.
+     */
+    @Data
+    public static class Planner {
+        @Min(0)
+        private int maxInputChars = 300_000;
     }
 }
