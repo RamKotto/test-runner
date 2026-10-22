@@ -99,6 +99,16 @@ app:
       - Для «тело содержит error: true и reason: ...» — отдельный assertBody на "error": true
         и отдельный assertBody на "reason": "...".
 
+      ПРАВИЛО 2.6 (КАСКАДНЫЙ SKIP — НЕ ПУТАТЬ С ПОЛЬЗОВАТЕЛЬСКИМ):
+      - Если среди "Уже выполненные шаги" есть шаг с action="skip", и этот шаг был apiCall,
+        а ТЕКУЩИЙ шаг — assertStatus/assertBody/assertHeader/parseJson —
+        верни operation="skip", reason="предыдущий apiCall пропущен, данных для проверки нет",
+        topicKey="cascaded_skip". НЕ возвращай needClarification для этого случая.
+      - Аналогично для UI: если шаг navigate/click был skip, а текущий шаг —
+        assertText/waitForText/assertPageText — верни operation="skip",
+        reason="предыдущий UI-шаг пропущен", topicKey="cascaded_skip".
+      - Каскадный skip — это СЛЕДСТВИЕ пропуска предыдущего шага, а не новый пользовательский SKIP.
+
       ПРАВИЛО 3 (E2E):
       - Если шаг «открыть страницу» — operation="navigate", value=<URL>.
       - Если шаг «скопировать curl из блока» — operation="assertText" на блоке с curl
@@ -106,9 +116,15 @@ app:
       - Если шаг «выполнить команду» — operation="apiCall" с method/path, извлечёнными из текста шага
         или из предыдущего enrichment'а с curl.
 
-      ПРАВИЛО 4 (SKIP):
-      - Если среди ответов пользователя уже есть ответ SKIP на вопрос с той же темой
-        (тот же topicKey или совпадающий reason) — верни operation="skip", reason="пользователь запросил пропуск".
+      ПРАВИЛО 4 (SKIP — СТРОГО):
+      operation="skip" разрешён ТОЛЬКО в двух случаях:
+        (а) сам текст ТЕКУЩЕГО шага начинается со слова "SKIP"/"пропустить" (регистр не важен);
+        (б) в блоке "Ранее пользователь ответил" есть запись, у которой topicKey ТОЧНО совпадает
+            с topicKey текущего шага, и answer буквально равен "SKIP".
+      В остальных случаях operation="skip" ЗАПРЕЩЁН.
+      Если не хватает данных — верни needClarification, НЕ skip.
+      Если текущий шаг — assert* и предыдущий apiCall/UI-шаг был skip —
+      используй ПРАВИЛО 2.6 (каскадный skip), а не пользовательский.
 
       ПРАВИЛО 5 (LOCATOR STRATEGY):
       - Приоритет: data-testid > id > role+name > aria-label > placeholder > label >
@@ -119,7 +135,7 @@ app:
 
       ПРАВИЛО 6 (ТОЧНОСТЬ):
       - Не выдумывай бизнес-логику и данные. Если для шага нужны данные, которых нет
-        ни в тексте шага, ни в ответах пользователя, ни в DOM-СНАПШОТЕ, ни в предыдущих
+        ни в тексте шага, ни в ответах пользователя, ни в DOM-СНАПШОТе, ни в предыдущих
         enrichment'ах — верни needClarification.
       - topicKey обязателен для needClarification. Выбирай из списка:
         api_base_url, start_url, ui_locator_<role>, case_type_mismatch,

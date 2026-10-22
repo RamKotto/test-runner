@@ -10,10 +10,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 /**
  * Гибридный исполнитель одного кейса: UI + API в одном прогоне.
@@ -28,13 +25,22 @@ public class HybridCaseRunner {
     private final UiExecutor uiExecutor;
     private final ApiExecutor apiExecutor;
 
+    /**
+     * FIX 5: добавлен stoppedAtStepIndex — чтобы /answers продолжал с шага,
+     * на котором остановились, а не прогонял кейс с нуля.
+     */
     public record Result(
             ExecutionOutcome outcome,
-            List<Clarification> clarifications
+            List<Clarification> clarifications,
+            int stoppedAtStepIndex
     ) {
     }
 
     public Result run(ParsedTestCase tc, String startUrl, String apiBaseUrl) {
+        return run(tc, startUrl, apiBaseUrl, 0);
+    }
+
+    public Result run(ParsedTestCase tc, String startUrl, String apiBaseUrl, int startStep) {
         String type = tc.type() == null ? "UI" : tc.type().trim().toUpperCase();
         boolean allowUi = !"API".equals(type);
         boolean allowApi = !"UI".equals(type);
@@ -47,9 +53,14 @@ public class HybridCaseRunner {
         Map<String, String> lastHeaders = new LinkedHashMap<>();
         Integer lastStatus = null;
 
+        // FIX 2: флаг наличия данных от apiCall. Если предыдущий apiCall был skip —
+        // assert-шаги каскадно пропускаются без обращения к executor'у и без clarification.
+        boolean apiDataAvailable = false;
+
         UiExecutor.UiSession uiSession = null;
+        int fromStep = Math.max(0, startStep);
         try {
-            for (int i = 0; i < tc.steps().size(); i++) {
+            for (int i = fromStep; i < tc.steps().size(); i++) {
                 String step = tc.steps().get(i);
 
                 StepPlanner.Plan plan;
@@ -67,29 +78,48 @@ public class HybridCaseRunner {
                 }
 
                 if (plan.isSkip()) {
-                    String reason = plan.reason() == null ? "" : ": " + plan.reason();
-                    enrichments.add(new StepEnrichment(i, "skip", "⏭ SKIP" + reason));
+                    String reason = plan.reason() == null ? "" : plan.reason();
+                    String topic = plan.topicKey();
+                    // FIX 2: различаем каскадный и пользовательский skip
+                    boolean cascaded = "cascaded_skip".equalsIgnoreCase(topic)
+                            || (reason != null && reason.toLowerCase().contains("предыдущ"));
+                    if ("apicall".equalsIgnoreCase(plan.operation())) {
+                        apiDataAvailable = false;
+                    }
+                    enrichments.add(new StepEnrichment(i, "skip",
+                            (cascaded ? "⏭ SKIP (каскад): " : "⏭ SKIP: ") + reason));
                     continue;
                 }
 
                 if (plan.needsClarification()) {
                     String topicKey = normalizeTopic(plan.topicKey(), plan.reason());
-                    if (isSkippedInThisCase(tc, topicKey) || findAnswerInThisCase(tc, topicKey) != null) {
+                    if (isSkippedInThisCase(tc, topicKey)
+                            || findAnswerInThisCase(tc, topicKey) != null) {
                         enrichments.add(new StepEnrichment(i, "skip",
                                 "⏭ SKIP по ответу пользователя (topic=" + topicKey + ")"));
                         continue;
                     }
                     clarifications.add(new Clarification(tc.id(), i,
-                            withTopic(plan.question(), topicKey), plan.reason(), "DATA_MISSING"));
+                            withTopic(plan.question(), topicKey), plan.reason(),
+                            "DATA_MISSING", topicKey));
                     return new Result(new ExecutionOutcome(
                             tc.id(), tc.sourceFilename(), "NEEDS_CLARIFICATION",
                             "Прервано на шаге " + (i + 1), enrichments),
-                            clarifications);
+                            clarifications, i);
                 }
 
                 String op = plan.operation() == null ? "" : plan.operation().toLowerCase();
                 boolean isUiOp = StepPlanner.UI_OPS.contains(op);
                 boolean isApiOp = StepPlanner.API_OPS.contains(op);
+
+                // FIX 2: каскадный skip для assert* при отсутствии данных apiCall
+                boolean isApiAssert = Set.of("assertbody", "assertheader",
+                        "assertstatus", "parsejson").contains(op);
+                if (isApiAssert && !apiDataAvailable) {
+                    enrichments.add(new StepEnrichment(i, op,
+                            "⏭ SKIP (каскад): нет данных от предыдущего apiCall"));
+                    continue;
+                }
 
                 if (isUiOp && !allowUi) {
                     failures.add("Шаг " + (i + 1) + ": API-кейс требует UI-операцию '" + op + "'");
@@ -107,7 +137,30 @@ public class HybridCaseRunner {
 
                 if (isUiOp) {
                     if (uiSession == null) {
-                        uiSession = uiExecutor.newSession(resolveStartUrl(tc, startUrl));
+                        String resolved = resolveStartUrl(tc, startUrl);
+                        // FIX 3: не создаём сессию на "SKIP"/пустом URL — это уйдёт в clarification
+                        if (resolved == null || resolved.isBlank()
+                                || "SKIP".equalsIgnoreCase(resolved.trim())
+                                || !(resolved.startsWith("http://") || resolved.startsWith("https://"))) {
+                            String topicKey = "start_url";
+                            if (isSkippedInThisCase(tc, topicKey)
+                                    || findAnswerInThisCase(tc, topicKey) != null) {
+                                enrichments.add(new StepEnrichment(i, "skip",
+                                        "⏭ SKIP по ответу (topic=start_url)"));
+                                continue;
+                            }
+                            clarifications.add(new Clarification(tc.id(), i,
+                                    withTopic("Шаг " + (i + 1) + " («" + step
+                                                    + "»): укажите стартовый URL (http(s)://...) для UI-кейса",
+                                            topicKey),
+                                    "startUrl не передан в RunRequest и не дан в ответах",
+                                    "DATA_MISSING", topicKey));
+                            return new Result(new ExecutionOutcome(
+                                    tc.id(), tc.sourceFilename(), "NEEDS_CLARIFICATION",
+                                    "Прервано на шаге " + (i + 1), enrichments),
+                                    clarifications, i);
+                        }
+                        uiSession = uiExecutor.newSession(resolved);
                     }
                     try {
                         uiExecutor.dumpHtml(uiSession, tc.id(), i);
@@ -129,11 +182,11 @@ public class HybridCaseRunner {
                         clarifications.add(new Clarification(tc.id(), i,
                                 withTopic("Шаг " + (i + 1) + " («" + step + "»): "
                                         + lnr.getMessage(), topicKey),
-                                "Ошибка планирования UI", "LOCATOR_NOT_FOUND"));
+                                "Ошибка планирования UI", "LOCATOR_NOT_FOUND", topicKey));
                         return new Result(new ExecutionOutcome(
                                 tc.id(), tc.sourceFilename(), "NEEDS_CLARIFICATION",
                                 "Прервано на шаге " + (i + 1), enrichments),
-                                clarifications);
+                                clarifications, i);
                     } catch (UiExecutor.UnsupportedUiOperation uuo) {
                         enrichments.add(new StepEnrichment(i, op, "❌ " + uuo.getMessage()));
                         failures.add("Шаг " + (i + 1) + ": " + uuo.getMessage());
@@ -152,11 +205,11 @@ public class HybridCaseRunner {
                         if (r.responseBody() != null) lastBody = r.responseBody();
                         if (r.responseHeaders() != null && !r.responseHeaders().isEmpty())
                             lastHeaders = r.responseHeaders();
-                        if (r.responseStatusCode() != null) lastStatus = r.responseStatusCode();
+                        if (r.responseStatusCode() != null) {
+                            lastStatus = r.responseStatusCode();
+                            apiDataAvailable = true;   // FIX 2: данные получены
+                        }
                     } catch (AssertionFailure af) {
-                        // Правка C: конфиг-ошибка на apiCall (неверный/недоступный base URL,
-                        // unknown protocol, connection refused) — это missing data,
-                        // а не FAILED. Возвращаем needClarification(api_base_url).
                         if ("apicall".equals(op) && isConfigError(af.getMessage())) {
                             String topicKey = "api_base_url";
                             if (isSkippedInThisCase(tc, topicKey)
@@ -169,18 +222,17 @@ public class HybridCaseRunner {
                             clarifications.add(new Clarification(tc.id(), i,
                                     withTopic("Шаг " + (i + 1) + " («" + step + "»): "
                                             + af.getMessage(), topicKey),
-                                    "Не задан/недоступен API base URL", "DATA_MISSING"));
+                                    "Не задан/недоступен API base URL",
+                                    "DATA_MISSING", topicKey));
                             return new Result(new ExecutionOutcome(
                                     tc.id(), tc.sourceFilename(), "NEEDS_CLARIFICATION",
                                     "Прервано на шаге " + (i + 1), enrichments),
-                                    clarifications);
+                                    clarifications, i);
                         }
                         enrichments.add(new StepEnrichment(i, op, "❌ " + af.getMessage()));
                         failures.add("Шаг " + (i + 1) + ": " + af.getMessage());
                     } catch (UiExecutor.LocatorNotResolved lnr) {
                         String topicKey = normalizeTopic(plan.topicKey(), lnr.getMessage());
-                        // Правка A: LocatorNotResolved от buildFullUrl содержит api_base_url-подсказку;
-                        // уважаем topicKey из плана, если модель его дала.
                         if (topicKey == null || topicKey.isBlank()
                                 || "clarification".equals(topicKey)) {
                             if (lnr.getMessage() != null
@@ -197,11 +249,11 @@ public class HybridCaseRunner {
                         clarifications.add(new Clarification(tc.id(), i,
                                 withTopic("Шаг " + (i + 1) + " («" + step + "»): "
                                         + lnr.getMessage(), topicKey),
-                                "Ошибка планирования API", "DATA_MISSING"));
+                                "Ошибка планирования API", "DATA_MISSING", topicKey));
                         return new Result(new ExecutionOutcome(
                                 tc.id(), tc.sourceFilename(), "NEEDS_CLARIFICATION",
                                 "Прервано на шаге " + (i + 1), enrichments),
-                                clarifications);
+                                clarifications, i);
                     } catch (Exception ex) {
                         log.error("API-шаг {} в {} упал", i + 1, tc.id(), ex);
                         enrichments.add(new StepEnrichment(i, op,
@@ -220,11 +272,11 @@ public class HybridCaseRunner {
                         tc.id(), tc.sourceFilename(), "FAILED",
                         failures.get(0) + (failures.size() > 1
                                 ? " (и ещё " + (failures.size() - 1) + ")" : ""),
-                        enrichments), List.of());
+                        enrichments), List.of(), tc.steps().size());
             }
             return new Result(new ExecutionOutcome(
                     tc.id(), tc.sourceFilename(), "PASSED", null, enrichments),
-                    List.of());
+                    List.of(), tc.steps().size());
         } finally {
             if (uiSession != null) {
                 try {
@@ -235,10 +287,6 @@ public class HybridCaseRunner {
         }
     }
 
-    /**
-     * Правка C: распознаём конфиг-ошибки apiCall, которые должны стать
-     * needClarification(api_base_url), а не FAILED.
-     */
     private static boolean isConfigError(String msg) {
         if (msg == null) return false;
         String m = msg.toLowerCase();
@@ -254,24 +302,43 @@ public class HybridCaseRunner {
                 || m.contains("не задан корректный apibaseurl");
     }
 
+    /**
+     * FIX 3: если startUrl не передан и в ответах — SKIP (не URL) —
+     * возвращаем null, чтобы вызывающий код ушёл в clarification(start_url).
+     */
     private String resolveStartUrl(ParsedTestCase tc, String fallback) {
         if (fallback != null && !fallback.isBlank()) return fallback;
         if (tc.answers() == null) return null;
         for (var a : tc.answers()) {
             if (a.topicKey() != null && a.topicKey().equalsIgnoreCase("start_url")) {
-                return a.answer();
+                String ans = a.answer();
+                if (ans != null && !ans.isBlank()
+                        && !"SKIP".equalsIgnoreCase(ans.trim())) {
+                    return ans.trim();
+                }
+                return null;
             }
         }
         return fallback;
     }
 
+    /**
+     * FIX 6: строгое сравнение по topicKey, а не по подстроке в question.
+     * Fallback на question — только если topicKey отсутствует (старые клиенты).
+     */
     private boolean isSkippedInThisCase(ParsedTestCase tc, String topicKey) {
         if (topicKey == null || topicKey.isBlank() || tc.answers() == null) return false;
         String needle = topicKey.trim().toLowerCase();
         for (var a : tc.answers()) {
-            String q = a.question() == null ? "" : a.question().toLowerCase();
+            String tk = a.topicKey() == null ? "" : a.topicKey().trim().toLowerCase();
             String ans = a.answer() == null ? "" : a.answer().trim();
-            if (q.contains(needle) && "SKIP".equalsIgnoreCase(ans)) return true;
+            if (!"SKIP".equalsIgnoreCase(ans)) continue;
+            if (tk.equals(needle)) return true;
+            // fallback для старых клиентов, где topicKey не был заполнен
+            if (tk.isEmpty()) {
+                String q = a.question() == null ? "" : a.question().toLowerCase();
+                if (q.contains(needle)) return true;
+            }
         }
         return false;
     }
@@ -280,8 +347,14 @@ public class HybridCaseRunner {
         if (topicKey == null || topicKey.isBlank() || tc.answers() == null) return null;
         String needle = topicKey.trim().toLowerCase();
         for (var a : tc.answers()) {
-            String q = a.question() == null ? "" : a.question().toLowerCase();
-            if (q.contains(needle)) return a.answer();
+            String tk = a.topicKey() == null ? "" : a.topicKey().trim().toLowerCase();
+            String ans = a.answer();
+            if (ans == null || ans.isBlank()) continue;
+            if (tk.equals(needle)) return ans;
+            if (tk.isEmpty()) {
+                String q = a.question() == null ? "" : a.question().toLowerCase();
+                if (q.contains(needle)) return ans;
+            }
         }
         return null;
     }

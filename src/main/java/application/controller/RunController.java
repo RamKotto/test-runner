@@ -31,7 +31,7 @@ public class RunController {
         }
         List<ParsedTestCase> testCases = fetcher.fetchAll(request.sourceUrl());
 
-        RunExecution exec = executeAll(testCases, request.startUrl(), request.apiBaseUrl(),
+        RunExecution exec = executeAll(testCases, 0, request.startUrl(), request.apiBaseUrl(),
                 List.of());
 
         String taskId = UUID.randomUUID().toString();
@@ -40,7 +40,8 @@ public class RunController {
         if (!exec.clarifications.isEmpty()) {
             sessions.put(taskId, new SessionStore.Session(
                     testCases, request.startUrl(), request.apiBaseUrl(),
-                    exec.stoppedAtCaseIndex, Instant.now(), List.of()));
+                    exec.stoppedAtCaseIndex, exec.stoppedAtStepIndex,
+                    Instant.now(), List.of()));
         }
 
         String indexUrl = saveIndexAndReturnUrl(exec.outcomes);
@@ -67,17 +68,19 @@ public class RunController {
         List<ParsedTestCase> remaining = session.testCases()
                 .subList(session.currentTestCaseIndex(), session.testCases().size());
 
-        RunExecution exec = executeAll(remaining, session.startUrl(), session.apiBaseUrl(),
-                allAnswers);
+        // FIX 5: продолжаем с шага, на котором остановились, а не с нуля
+        RunExecution exec = executeAll(remaining, session.currentStepIndex(),
+                session.startUrl(), session.apiBaseUrl(), allAnswers);
         String status = exec.clarifications.isEmpty() ? "DONE" : "NEEDS_CLARIFICATION";
 
         if (exec.clarifications.isEmpty()) {
             sessions.remove(taskId);
         } else {
-            int absoluteIndex = session.currentTestCaseIndex() + exec.stoppedAtCaseIndex;
+            int absoluteCaseIndex = session.currentTestCaseIndex() + exec.stoppedAtCaseIndex;
             sessions.put(taskId, new SessionStore.Session(
                     session.testCases(), session.startUrl(), session.apiBaseUrl(),
-                    absoluteIndex, Instant.now(), allAnswers));
+                    absoluteCaseIndex, exec.stoppedAtStepIndex,
+                    Instant.now(), allAnswers));
         }
 
         String indexUrl = saveIndexAndReturnUrl(exec.outcomes);
@@ -87,17 +90,23 @@ public class RunController {
 
     private record RunExecution(List<ExecutionOutcome> outcomes,
                                 List<Clarification> clarifications,
-                                int stoppedAtCaseIndex) {
+                                int stoppedAtCaseIndex,
+                                int stoppedAtStepIndex) {
     }
 
-    private RunExecution executeAll(List<ParsedTestCase> cases, String startUrl, String apiBaseUrl,
+    private RunExecution executeAll(List<ParsedTestCase> cases, int startStep,
+                                    String startUrl, String apiBaseUrl,
                                     List<AnswerRequest.Answer> answers) {
         List<ExecutionOutcome> outcomes = new ArrayList<>();
         List<Clarification> clarifications = new ArrayList<>();
-        int stoppedAt = 0;
+        int stoppedAtCase = 0;
+        int stoppedAtStep = 0;
 
         for (int i = 0; i < cases.size(); i++) {
             ParsedTestCase tc = cases.get(i);
+
+            // FIX 5: на первом кейсе после /answers стартуем с сохранённого шага
+            int caseStartStep = (i == 0) ? startStep : 0;
 
             ParsedTestCase tcWithAnswers = new ParsedTestCase(
                     tc.id(), tc.type(), tc.title(), tc.requirementRef(),
@@ -106,7 +115,7 @@ public class RunController {
                     answers);
 
             TestCaseRunnerService.RunnerOutcome result =
-                    runner.runCase(tcWithAnswers, startUrl, apiBaseUrl);
+                    runner.runCase(tcWithAnswers, startUrl, apiBaseUrl, caseStartStep);
             ExecutionOutcome outcome = result.outcome();
 
             String enriched = renderer.renderEnriched(tc, outcome.enrichments());
@@ -116,12 +125,13 @@ public class RunController {
 
             if ("NEEDS_CLARIFICATION".equals(outcome.status())) {
                 clarifications.addAll(result.clarifications());
-                stoppedAt = i;
-                return new RunExecution(outcomes, clarifications, stoppedAt);
+                stoppedAtCase = i;
+                stoppedAtStep = result.stoppedAtStepIndex();
+                return new RunExecution(outcomes, clarifications, stoppedAtCase, stoppedAtStep);
             }
             // SKIPPED и FAILED не прерывают прогон — переходим к следующему кейсу
         }
-        return new RunExecution(outcomes, clarifications, stoppedAt);
+        return new RunExecution(outcomes, clarifications, stoppedAtCase, stoppedAtStep);
     }
 
     private String saveIndexAndReturnUrl(List<ExecutionOutcome> outcomes) {

@@ -15,11 +15,16 @@ import java.util.concurrent.ConcurrentHashMap;
 @RequiredArgsConstructor
 public class SessionStore {
 
+    /**
+     * FIX 5: добавлен currentStepIndex — чтобы после /answers продолжать
+     * кейс с того же шага, а не с нуля (иначе один и тот же вопрос задаётся дважды).
+     */
     public record Session(
             List<ParsedTestCase> testCases,
             String startUrl,
             String apiBaseUrl,
             int currentTestCaseIndex,
+            int currentStepIndex,
             Instant createdAt,
             List<AnswerRequest.Answer> answers
     ) {
@@ -37,8 +42,8 @@ public class SessionStore {
         }
         sessions.put(taskId, new Session(
                 session.testCases(), session.startUrl(), session.apiBaseUrl(),
-                session.currentTestCaseIndex(), Instant.now(),
-                dedupe(session.answers())));
+                session.currentTestCaseIndex(), session.currentStepIndex(),
+                Instant.now(), dedupe(session.answers())));
     }
 
     public Session get(String taskId) {

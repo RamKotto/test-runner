@@ -15,19 +15,24 @@ public class Dtos {
         }
     }
 
+    /**
+     * FIX 6: добавлен topicKey — чтобы клиент мог возвращать его явно,
+     * а сервер матчил ответы по точному topicKey, а не по подстроке в question.
+     */
     public record Clarification(
             String testCaseId,
             Integer stepIndex,
             String question,
             String reason,
-            String category
+            String category,
+            String topicKey
     ) {
+        public Clarification(String testCaseId, Integer stepIndex, String question,
+                             String reason, String category) {
+            this(testCaseId, stepIndex, question, reason, category, null);
+        }
     }
 
-    /**
-     * Один элемент, к которому относится шаг. Для multi-element шага
-     * (например, «проверить все строки таблицы») elements.size() == N.
-     */
     public record ElementInfo(
             int index,
             String locator,
@@ -44,14 +49,6 @@ public class Dtos {
     ) {
     }
 
-    /**
-     * Обогащение шага. Универсальное: и UI, и API.
-     * - elements       — затронутые DOM-элементы (для UI), пусто для API;
-     * - requestCurl    — готовый curl для копирования (для API), null для UI;
-     * - requestBody    — тело запроса (для API), null для UI;
-     * - responseSample — пример ответа (обрезанный), null для UI;
-     * - subEnrichments — вложенные enrichment'ы (например, для E2E «открыть + curl + проверить»).
-     */
     public record StepEnrichment(
             int stepIndex,
             String action,

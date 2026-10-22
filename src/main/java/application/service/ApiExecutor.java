@@ -50,8 +50,11 @@ public class ApiExecutor {
             if (expected == null || expected.isBlank()) {
                 throw new UiExecutor.LocatorNotResolved("assertBody: не указано значение для проверки");
             }
+            // FIX 4: отсутствие данных — это AssertionFailure (результат теста),
+            // а не повод спрашивать пользователя.
             if (lastResponseBody == null) {
-                throw new UiExecutor.LocatorNotResolved("assertBody: нет тела предыдущего ответа");
+                throw new AssertionFailure("assertBody: нет тела предыдущего ответа"
+                        + " (предыдущий apiCall пропущен или не выполнен)");
             }
             int idx = lastResponseBody.indexOf(expected);
             if (idx < 0) {
@@ -75,7 +78,8 @@ public class ApiExecutor {
                 throw new UiExecutor.LocatorNotResolved("assertHeader: нужны имя и значение");
             }
             if (lastResponseHeaders == null || lastResponseHeaders.isEmpty()) {
-                throw new UiExecutor.LocatorNotResolved("assertHeader: нет заголовков");
+                throw new AssertionFailure("assertHeader: нет заголовков предыдущего ответа"
+                        + " (предыдущий apiCall пропущен или не выполнен)");
             }
             String actual = findHeaderIgnoreCase(lastResponseHeaders, name);
             StringBuilder detail = new StringBuilder("assertHeader\n");
@@ -106,8 +110,10 @@ public class ApiExecutor {
             if (expected == null || expected.isBlank()) {
                 throw new UiExecutor.LocatorNotResolved("assertStatus: не указано ожидаемое значение");
             }
+            // FIX 4: отсутствие статуса — AssertionFailure, не LocatorNotResolved
             if (lastStatusCode == null) {
-                throw new UiExecutor.LocatorNotResolved("assertStatus: нет статуса предыдущего ответа");
+                throw new AssertionFailure("assertStatus: нет статуса предыдущего ответа"
+                        + " (предыдущий apiCall пропущен или не выполнен)");
             }
             boolean matched;
             if (expected.endsWith("xx")) {
@@ -137,8 +143,10 @@ public class ApiExecutor {
         }
 
         if ("parsejson".equals(op)) {
+            // FIX 4: отсутствие тела — AssertionFailure
             if (lastResponseBody == null || lastResponseBody.isBlank()) {
-                throw new UiExecutor.LocatorNotResolved("parseJson: нет тела");
+                throw new AssertionFailure("parseJson: нет тела предыдущего ответа"
+                        + " (предыдущий apiCall пропущен или не выполнен)");
             }
             try {
                 var node = mapper.readTree(lastResponseBody);
@@ -165,8 +173,6 @@ public class ApiExecutor {
         if (method.isEmpty()) method = "GET";
         String path = plan.path();
 
-        // Правка A: падаем LocatorNotResolved ДО RestAssured, если URL не абсолютный
-        // и apiBaseUrl отсутствует/невалиден. Это уходит в needClarification(api_base_url).
         String fullUrl = buildFullUrl(apiBaseUrl, path);
 
         URI uri;
@@ -371,12 +377,6 @@ public class ApiExecutor {
         return null;
     }
 
-    /**
-     * Правка A: собираем абсолютный URL. Если path относительный, а apiBaseUrl
-     * отсутствует/невалиден — бросаем LocatorNotResolved (→ needClarification),
-     * чтобы НЕ доходить до RestAssured с "null://null" и не получать
-     * "unknown protocol: null" как FAILED.
-     */
     private String buildFullUrl(String apiBaseUrl, String path) {
         if (path != null && (path.startsWith("http://") || path.startsWith("https://"))) {
             return path;
