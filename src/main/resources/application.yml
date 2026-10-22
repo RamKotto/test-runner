@@ -22,7 +22,6 @@ app:
   sessions:
     ttl-minutes: 180
     max-count: 500
-    max-markdown-chars: 1000000
   enrichment-body-limit: 0
   debug:
     dump-html: ${APP_DEBUG_DUMP_HTML:false}
@@ -41,15 +40,15 @@ app:
 
       Формат ответа:
       {
-        "operation": "navigate|click|fill|assertText|waitForText|assertPageText|apiCall|assertBody|assertHeader|assertStatus|parseJson|skip|needClarification",
-        "locator": "CSS-селектор (для UI-шага с одним элементом)",
+        "operation": "navigate|click|fill|assertText|waitForText|assertPageText|apiCall|assertBody|assertBodyAbsent|assertHeader|assertHeaderAbsent|assertStatus|parseJson|skip|needClarification",
+        "locator": "CSS-селектор (для UI-шага с одним элементом); для assertHeader/assertHeaderAbsent — имя заголовка",
         "elements": [
           {"locator": "...", "locatorStrategy": "testid|id|role|text|css|xpath",
            "elementRole": "button|link|textbox|heading|code|cell|...",
            "elementName": "видимый текст (до 80 символов)",
            "alternatives": ["#alt1","#alt2"]}
         ],
-        "value": "значение для fill/assertText/waitForText/assertPageText/assertBody/assertHeader/assertStatus/navigate",
+        "value": "значение для fill/assertText/waitForText/assertPageText/assertBody/assertBodyAbsent/assertHeader/assertHeaderAbsent/assertStatus/navigate",
         "method": "GET|POST|PUT|DELETE|PATCH (для apiCall)",
         "path": "/path или полный URL (для apiCall)",
         "bodyJson": "{}",
@@ -66,10 +65,12 @@ app:
 
       ПРАВИЛО 0 (РАЗДЕЛЕНИЕ UI И API ПО ТИПУ КЕЙСА):
       - UI: разрешены ТОЛЬКО navigate, click, fill, assertText, waitForText, assertPageText, skip, needClarification.
-        Любая API-операция (apiCall, assertHeader, assertStatus, parseJson, assertBody) ЗАПРЕЩЕНА.
+        Любая API-операция (apiCall, assertHeader, assertHeaderAbsent, assertStatus, parseJson,
+        assertBody, assertBodyAbsent) ЗАПРЕЩЕНА.
         Если шаг UI-кейса требует HTTP-запроса — верни needClarification с topicKey="case_type_mismatch"
         и reason="Шаг требует API-операции, но кейс помечен как UI".
-      - API: разрешены ТОЛЬКО apiCall, assertBody, assertHeader, assertStatus, parseJson, skip, needClarification.
+      - API: разрешены ТОЛЬКО apiCall, assertBody, assertBodyAbsent, assertHeader,
+        assertHeaderAbsent, assertStatus, parseJson, skip, needClarification.
         Любая UI-операция ЗАПРЕЩЕНА. Если шаг требует UI-действия — needClarification с topicKey="case_type_mismatch".
       - E2E, NEGATIVE, SECURITY: разрешены ЛЮБЫЕ операции из обоих наборов.
         Это гибридные кейсы: могут открыть страницу (navigate/click/fill/assertText), скопировать curl
@@ -90,8 +91,15 @@ app:
       - Для GET без тела: bodyJson = "{}".
       - Если шаг требует проверить HTTP-статус — operation="assertStatus", value="200"|"4xx".
         Новый apiCall не выполняй — статус уже сохранён из предыдущего шага.
-      - Если шаг проверяет тело — operation="assertBody", value=<подстрока из ожидаемого/фактического тела>.
-      - Если проверяется заголовок — operation="assertHeader", locator=<имя>, value=<значение>.
+      - Если шаг проверяет ПРИСУТСТВИЕ подстроки в теле — operation="assertBody", value=<подстрока>.
+      - Если шаг проверяет ОТСУТСТВИЕ подстроки/ключа в теле — operation="assertBodyAbsent",
+        value=<подстрока, которой быть НЕ должно>.
+        ВАЖНО: если в шаге перечислены НЕСКОЛЬКО ключей (например, «нет ключей hourly, daily,
+        minutely_15»), верни НЕСКОЛЬКО подшагов assertBodyAbsent, по одному на каждый ключ.
+        Для ключей JSON формат value: "\"hourly\":" (с двоеточием и кавычками) — так надёжнее.
+      - Если шаг проверяет ЗАГОЛОВОК — operation="assertHeader", locator=<имя>, value=<значение>.
+      - Если шаг проверяет ОТСУТСТВИЕ заголовка — operation="assertHeaderAbsent",
+        locator=<имя>, value=<опционально: если задано, падаем только при совпадении значения>.
       - Если проверяется валидность JSON — operation="parseJson" без value.
       - Если ожидается ошибка клиента (400) — укажи expectedStatus=400 в apiCall
         ИЛИ отдельный шаг assertStatus со value="400".
@@ -101,8 +109,9 @@ app:
 
       ПРАВИЛО 2.6 (КАСКАДНЫЙ SKIP — НЕ ПУТАТЬ С ПОЛЬЗОВАТЕЛЬСКИМ):
       - Если среди "Уже выполненные шаги" есть шаг с action="skip", и этот шаг был apiCall,
-        а ТЕКУЩИЙ шаг — assertStatus/assertBody/assertHeader/parseJson —
-        верни operation="skip", reason="предыдущий apiCall пропущен, данных для проверки нет",
+        а ТЕКУЩИЙ шаг — assertStatus/assertBody/assertBodyAbsent/assertHeader/
+        assertHeaderAbsent/parseJson — верни operation="skip",
+        reason="предыдущий apiCall пропущен, данных для проверки нет",
         topicKey="cascaded_skip". НЕ возвращай needClarification для этого случая.
       - Аналогично для UI: если шаг navigate/click был skip, а текущий шаг —
         assertText/waitForText/assertPageText — верни operation="skip",
@@ -142,6 +151,13 @@ app:
         expected_value, coordinates, auth_token. Иначе — "other:<краткое_описание>".
       - Пояснения к sample body в ответе apiCall: сервер логирует тело ПОЛНОСТЬЮ
         (pretty-print JSON, без обрезки). Используй точные подстроки из него для assertBody.
+
+      ПРАВИЛО 7 (ОТСУТСТВИЕ КЛЮЧЕЙ В JSON):
+      - Если шаг требует «в ответе нет ключей X, Y, Z» — верни отдельные assertBodyAbsent
+        для каждого ключа: value="\"X\":" (с двоеточием и кавычками), value="\"Y\":" и т.д.
+        Это надёжнее, чем проверять просто имя ключа.
+      - Если шаг требует «в ответе нет значения null для X» — используй assertBodyAbsent
+        со value="\"X\": null" (или "\"X\":null" — модель сама подберёт формат из sample).
 
 openrouter:
   base-url: https://openrouter.ai/api/v1

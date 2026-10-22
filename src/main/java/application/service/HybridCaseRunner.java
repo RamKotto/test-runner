@@ -12,10 +12,6 @@ import org.springframework.stereotype.Service;
 
 import java.util.*;
 
-/**
- * Гибридный исполнитель одного кейса: UI + API в одном прогоне.
- * Используется для типов UI, API, E2E, NEGATIVE, SECURITY.
- */
 @Slf4j
 @Service
 @RequiredArgsConstructor
@@ -25,10 +21,6 @@ public class HybridCaseRunner {
     private final UiExecutor uiExecutor;
     private final ApiExecutor apiExecutor;
 
-    /**
-     * FIX 5: добавлен stoppedAtStepIndex — чтобы /answers продолжал с шага,
-     * на котором остановились, а не прогонял кейс с нуля.
-     */
     public record Result(
             ExecutionOutcome outcome,
             List<Clarification> clarifications,
@@ -53,8 +45,6 @@ public class HybridCaseRunner {
         Map<String, String> lastHeaders = new LinkedHashMap<>();
         Integer lastStatus = null;
 
-        // FIX 2: флаг наличия данных от apiCall. Если предыдущий apiCall был skip —
-        // assert-шаги каскадно пропускаются без обращения к executor'у и без clarification.
         boolean apiDataAvailable = false;
 
         UiExecutor.UiSession uiSession = null;
@@ -80,7 +70,6 @@ public class HybridCaseRunner {
                 if (plan.isSkip()) {
                     String reason = plan.reason() == null ? "" : plan.reason();
                     String topic = plan.topicKey();
-                    // FIX 2: различаем каскадный и пользовательский skip
                     boolean cascaded = "cascaded_skip".equalsIgnoreCase(topic)
                             || (reason != null && reason.toLowerCase().contains("предыдущ"));
                     if ("apicall".equalsIgnoreCase(plan.operation())) {
@@ -112,8 +101,8 @@ public class HybridCaseRunner {
                 boolean isUiOp = StepPlanner.UI_OPS.contains(op);
                 boolean isApiOp = StepPlanner.API_OPS.contains(op);
 
-                // FIX 2: каскадный skip для assert* при отсутствии данных apiCall
-                boolean isApiAssert = Set.of("assertbody", "assertheader",
+                boolean isApiAssert = Set.of("assertbody", "assertbodyabsent",
+                        "assertheader", "assertheaderabsent",
                         "assertstatus", "parsejson").contains(op);
                 if (isApiAssert && !apiDataAvailable) {
                     enrichments.add(new StepEnrichment(i, op,
@@ -138,7 +127,6 @@ public class HybridCaseRunner {
                 if (isUiOp) {
                     if (uiSession == null) {
                         String resolved = resolveStartUrl(tc, startUrl);
-                        // FIX 3: не создаём сессию на "SKIP"/пустом URL — это уйдёт в clarification
                         if (resolved == null || resolved.isBlank()
                                 || "SKIP".equalsIgnoreCase(resolved.trim())
                                 || !(resolved.startsWith("http://") || resolved.startsWith("https://"))) {
@@ -207,7 +195,7 @@ public class HybridCaseRunner {
                             lastHeaders = r.responseHeaders();
                         if (r.responseStatusCode() != null) {
                             lastStatus = r.responseStatusCode();
-                            apiDataAvailable = true;   // FIX 2: данные получены
+                            apiDataAvailable = true;
                         }
                     } catch (AssertionFailure af) {
                         if ("apicall".equals(op) && isConfigError(af.getMessage())) {
@@ -302,10 +290,6 @@ public class HybridCaseRunner {
                 || m.contains("не задан корректный apibaseurl");
     }
 
-    /**
-     * FIX 3: если startUrl не передан и в ответах — SKIP (не URL) —
-     * возвращаем null, чтобы вызывающий код ушёл в clarification(start_url).
-     */
     private String resolveStartUrl(ParsedTestCase tc, String fallback) {
         if (fallback != null && !fallback.isBlank()) return fallback;
         if (tc.answers() == null) return null;
@@ -322,10 +306,6 @@ public class HybridCaseRunner {
         return fallback;
     }
 
-    /**
-     * FIX 6: строгое сравнение по topicKey, а не по подстроке в question.
-     * Fallback на question — только если topicKey отсутствует (старые клиенты).
-     */
     private boolean isSkippedInThisCase(ParsedTestCase tc, String topicKey) {
         if (topicKey == null || topicKey.isBlank() || tc.answers() == null) return false;
         String needle = topicKey.trim().toLowerCase();
@@ -334,7 +314,6 @@ public class HybridCaseRunner {
             String ans = a.answer() == null ? "" : a.answer().trim();
             if (!"SKIP".equalsIgnoreCase(ans)) continue;
             if (tk.equals(needle)) return true;
-            // fallback для старых клиентов, где topicKey не был заполнен
             if (tk.isEmpty()) {
                 String q = a.question() == null ? "" : a.question().toLowerCase();
                 if (q.contains(needle)) return true;

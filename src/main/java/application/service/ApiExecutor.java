@@ -50,8 +50,6 @@ public class ApiExecutor {
             if (expected == null || expected.isBlank()) {
                 throw new UiExecutor.LocatorNotResolved("assertBody: не указано значение для проверки");
             }
-            // FIX 4: отсутствие данных — это AssertionFailure (результат теста),
-            // а не повод спрашивать пользователя.
             if (lastResponseBody == null) {
                 throw new AssertionFailure("assertBody: нет тела предыдущего ответа"
                         + " (предыдущий apiCall пропущен или не выполнен)");
@@ -67,6 +65,31 @@ public class ApiExecutor {
             log.info("API-шаг {}: {}", stepIndex + 1, detail);
             return new ApiStepResult(
                     StepEnrichment.api(stepIndex, "assertBody", detail,
+                            null, null, truncateSample(lastResponseBody)),
+                    lastResponseBody, lastResponseHeaders, lastStatusCode);
+        }
+
+        if ("assertbodyabsent".equals(op)) {
+            String forbidden = plan.value();
+            if (forbidden == null || forbidden.isBlank()) {
+                throw new UiExecutor.LocatorNotResolved(
+                        "assertBodyAbsent: не указано значение для проверки отсутствия");
+            }
+            if (lastResponseBody == null) {
+                throw new AssertionFailure("assertBodyAbsent: нет тела предыдущего ответа"
+                        + " (предыдущий apiCall пропущен или не выполнен)");
+            }
+            int idx = lastResponseBody.indexOf(forbidden);
+            if (idx >= 0) {
+                String ctx = contextAround(lastResponseBody, idx, forbidden.length(), 120);
+                throw new AssertionFailure("assertBodyAbsent: тело содержит `" + forbidden
+                        + "`, а не должно. Context:\n" + ctx);
+            }
+            String detail = "assertBodyAbsent → `" + forbidden + "` отсутствует в теле"
+                    + " (длина тела: " + lastResponseBody.length() + " символов)";
+            log.info("API-шаг {}: {}", stepIndex + 1, detail);
+            return new ApiStepResult(
+                    StepEnrichment.api(stepIndex, "assertBodyAbsent", detail,
                             null, null, truncateSample(lastResponseBody)),
                     lastResponseBody, lastResponseHeaders, lastStatusCode);
         }
@@ -105,12 +128,48 @@ public class ApiExecutor {
                     lastResponseBody, lastResponseHeaders, lastStatusCode);
         }
 
+        if ("assertheaderabsent".equals(op)) {
+            String name = plan.locator();
+            if (name == null || name.isBlank()) {
+                throw new UiExecutor.LocatorNotResolved("assertHeaderAbsent: не указано имя заголовка");
+            }
+            if (lastResponseHeaders == null) {
+                throw new AssertionFailure("assertHeaderAbsent: нет заголовков предыдущего ответа"
+                        + " (предыдущий apiCall пропущен или не выполнен)");
+            }
+            String actual = findHeaderIgnoreCase(lastResponseHeaders, name);
+            StringBuilder detail = new StringBuilder("assertHeaderAbsent\n");
+            detail.append("   • checked `").append(name).append("` → ")
+                    .append(actual == null ? "✅ отсутствует" : "`" + actual + "`")
+                    .append("\n");
+            if (actual != null) {
+                String expected = plan.value();
+                if (expected != null && !expected.isBlank()
+                        && !actual.toLowerCase().contains(expected.toLowerCase())) {
+                    detail.append("   • но значение `").append(actual)
+                            .append("` не содержит `").append(expected).append("` — ок\n");
+                    log.info("API-шаг {}: assertHeaderAbsent `{}` ok (значение не совпало)",
+                            stepIndex + 1, name);
+                    return new ApiStepResult(
+                            StepEnrichment.api(stepIndex, "assertHeaderAbsent", detail.toString(),
+                                    null, null, null),
+                            lastResponseBody, lastResponseHeaders, lastStatusCode);
+                }
+                throw new AssertionFailure("assertHeaderAbsent: заголовок `" + name
+                        + "` присутствует (`" + actual + "`), а не должен");
+            }
+            log.info("API-шаг {}: assertHeaderAbsent `{}` ok", stepIndex + 1, name);
+            return new ApiStepResult(
+                    StepEnrichment.api(stepIndex, "assertHeaderAbsent", detail.toString(),
+                            null, null, null),
+                    lastResponseBody, lastResponseHeaders, lastStatusCode);
+        }
+
         if ("assertstatus".equals(op)) {
             String expected = plan.value();
             if (expected == null || expected.isBlank()) {
                 throw new UiExecutor.LocatorNotResolved("assertStatus: не указано ожидаемое значение");
             }
-            // FIX 4: отсутствие статуса — AssertionFailure, не LocatorNotResolved
             if (lastStatusCode == null) {
                 throw new AssertionFailure("assertStatus: нет статуса предыдущего ответа"
                         + " (предыдущий apiCall пропущен или не выполнен)");
@@ -143,7 +202,6 @@ public class ApiExecutor {
         }
 
         if ("parsejson".equals(op)) {
-            // FIX 4: отсутствие тела — AssertionFailure
             if (lastResponseBody == null || lastResponseBody.isBlank()) {
                 throw new AssertionFailure("parseJson: нет тела предыдущего ответа"
                         + " (предыдущий apiCall пропущен или не выполнен)");

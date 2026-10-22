@@ -23,8 +23,10 @@ public class StepPlanner {
 
     public static final Set<String> UI_OPS = Set.of(
             "navigate", "click", "fill", "asserttext", "waitfortext", "assertpagetext");
+
     public static final Set<String> API_OPS = Set.of(
-            "apicall", "assertbody", "assertheader", "assertstatus", "parsejson");
+            "apicall", "assertbody", "assertheader", "assertstatus", "parsejson",
+            "assertbodyabsent", "assertheaderabsent");
 
     private final OpenRouterClient openRouter;
     private final AppProperties appProps;
@@ -153,8 +155,9 @@ public class StepPlanner {
                         .append(": ").append(e.action()).append(" → ")
                         .append(truncate(e.detail(), 500)).append("\n");
             }
-            user.append("\nДля проверки тела используй assertBody, заголовка — assertHeader, ")
-                    .append("валидности JSON — parseJson, статуса — assertStatus.\n\n");
+            user.append("\nДля проверки тела используй assertBody, отсутствия подстроки — ")
+                    .append("assertBodyAbsent, заголовка — assertHeader, отсутствия заголовка — ")
+                    .append("assertHeaderAbsent, валидности JSON — parseJson, статуса — assertStatus.\n\n");
         }
 
         if (domSnapshot != null && !domSnapshot.isBlank()) {
@@ -163,7 +166,6 @@ public class StepPlanner {
                     .append("\n");
         }
 
-        // Правка B: явный контракт по apiBaseUrl + path.
         if (apiBaseUrl == null || apiBaseUrl.isBlank()) {
             user.append("\nAPI base URL НЕ ЗАДАН. ");
             user.append("Если шаг требует HTTP-запроса, верни needClarification ")
