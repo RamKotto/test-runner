@@ -29,6 +29,8 @@ public class TestCaseFetcher {
     private static final Pattern INDEX_PATTERN =
             Pattern.compile("^(.*?)__?index(?:_\\d+)?\\.md$");
 
+    private static final int MAX_VERSION_PROBE = 50;
+
     public TestCaseFetcher(RestClient fileFetchRestClient,
                            TestCaseParser parser,
                            AppProperties appProps) {
@@ -50,7 +52,7 @@ public class TestCaseFetcher {
 
         if (trimmed.endsWith(".md")) {
             log.info("Скачиваем индекс напрямую: {}", trimmed);
-            String indexMd = get(trimmed);
+            String indexMd = getWithVersionFallback(trimmed);
             String baseDirUrl = trimmed.substring(0, trimmed.lastIndexOf('/') + 1);
             String indexFilename = trimmed.substring(trimmed.lastIndexOf('/') + 1);
             String prefix = extractPrefix(indexFilename);
@@ -63,7 +65,7 @@ public class TestCaseFetcher {
         String baseDirUrl = normalizeDirUrl(trimmed);
         String indexUrl = baseDirUrl + "_index.md";
         try {
-            String indexMd = get(indexUrl);
+            String indexMd = getWithVersionFallback(indexUrl);
             if (!parser.isIndexMarkdown(indexMd)) {
                 return List.of(parseSingle(indexUrl, indexMd));
             }
@@ -103,9 +105,14 @@ public class TestCaseFetcher {
             }
             String fileUrl = baseDirUrl + actualFilename;
             try {
-                String md = get(fileUrl);
-                result.add(parser.parse(md, actualFilename));
-                saveCopy(actualFilename, md);
+                // FIX (index desync): если файл X.md не найден, пробуем X_N.md
+                // и берём максимальный N. Это защита от рассинхрона индекса
+                // первого агента, где _index.md ссылается на «чистое» имя,
+                // а реальный файл сохранён как X_2.md / X_3.md.
+                String md = getWithVersionFallback(fileUrl);
+                String effectiveFilename = lastResolvedFilename.get();
+                result.add(parser.parse(md, effectiveFilename));
+                saveCopy(effectiveFilename, md);
             } catch (Exception ex) {
                 log.warn("Не удалось скачать {}: {}", fileUrl, ex.getMessage());
             }
@@ -117,12 +124,65 @@ public class TestCaseFetcher {
         return result;
     }
 
+    /**
+     * ThreadLocal: последнее фактически скачанное имя (с суффиксом версии).
+     */
+    private final ThreadLocal<String> lastResolvedFilename = ThreadLocal.withInitial(() -> null);
+
     private ParsedTestCase parseSingle(String url, String md) {
         String name = url.substring(url.lastIndexOf('/') + 1);
         String safe = parser.toSafeFilename(name);
         if (safe == null) safe = "testcase.md";
         saveCopy(safe, md);
         return parser.parse(md, safe);
+    }
+
+    /**
+     * FIX (index desync): если url не найден (404/пустой), пробуем версии
+     * base_2.md, base_3.md, … base_MAX.md и берём максимальную.
+     * Так мы не зависим от того, что _index.md ссылается на «каноническое» имя.
+     */
+    private String getWithVersionFallback(String url) {
+        lastResolvedFilename.set(url.substring(url.lastIndexOf('/') + 1));
+        // 1) пробуем исходный URL
+        try {
+            String body = get(url);
+            if (body != null && !body.isBlank()) {
+                return body;
+            }
+        } catch (FetchException e) {
+            // 404/ошибка — переходим к версионному поиску
+            log.debug("Прямое скачивание {} не удалось: {}", url, e.getMessage());
+        }
+
+        // 2) пробуем _2, _3, … до MAX_VERSION_PROBE
+        int dot = url.lastIndexOf('.');
+        if (dot < 0) {
+            throw new FetchException("Некорректный URL без расширения: " + url);
+        }
+        String base = url.substring(0, dot);
+        String ext = url.substring(dot);
+        String bestBody = null;
+        String bestFilename = null;
+        for (int i = 2; i <= MAX_VERSION_PROBE; i++) {
+            String candidate = base + "_" + i + ext;
+            try {
+                String body = get(candidate);
+                if (body != null && !body.isBlank()) {
+                    bestBody = body;
+                    bestFilename = candidate.substring(candidate.lastIndexOf('/') + 1);
+                    // не прерываемся — ищем максимальную версию
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        if (bestBody == null) {
+            throw new FetchException("Файл не найден ни в одной версии: " + url);
+        }
+        lastResolvedFilename.set(bestFilename);
+        log.warn("Файл {} не найден, использована версия {} (индекс устарел)",
+                url.substring(url.lastIndexOf('/') + 1), bestFilename);
+        return bestBody;
     }
 
     private String get(String url) {
