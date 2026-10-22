@@ -36,6 +36,14 @@ public class OpenRouterClient {
         body.put("response_format", Map.of("type", "json_object"));
         body.put("reasoning", Map.of("effort", "high"));
 
+        // Стабилизация недетерминизма LLM:
+        // - temperature=0 + top_p=1 → жадное декодирование
+        // - seed=42 → фиксированный seed (провайдеры, поддерживающие его, дают
+        //   воспроизводимые ответы)
+        body.put("temperature", 0);
+        body.put("top_p", 1);
+        body.put("seed", 42);
+
         try {
             Map<String, Object> response = http.post()
                     .uri("/chat/completions")

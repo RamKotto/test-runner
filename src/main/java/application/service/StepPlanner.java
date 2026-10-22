@@ -142,6 +142,11 @@ public class StepPlanner {
      * FIX (сравнение между шагами): параметр {@code snapshots} передаёт модели
      * уже снятые значения, чтобы она не пыталась снять заново и могла ссылаться
      * на них в assert*EqualsSnapshot.
+     * <p>
+     * FIX (будущие шаги): в промпт добавлен список последующих шагов кейса —
+     * это нужно, чтобы ПРАВИЛО 8.1 (snapshot СРАЗУ при выполнении эталона)
+     * реально работало: модель видит «Шаг #3: Сравнить …» и понимает,
+     * что на текущем шаге надо снять snapshot.
      */
     public List<Plan> planStep(ParsedTestCase tc, int stepIndex, String stepText, String domSnapshot,
                                String apiBaseUrl, List<StepEnrichment> previousEnrichments,
@@ -151,7 +156,28 @@ public class StepPlanner {
         user.append("Тип кейса: ").append(tc.type()).append("\n");
         user.append("Тест-кейс: ").append(tc.id()).append(" — ").append(tc.title()).append("\n");
         user.append("Ожидаемый результат всего кейса: ").append(tc.expectedResult()).append("\n\n");
+
+        if (tc.steps() != null && !tc.steps().isEmpty()) {
+            user.append("Все шаги кейса (контекст для планирования снимков):\n");
+            for (int j = 0; j < tc.steps().size(); j++) {
+                String marker = (j == stepIndex) ? "  ← ТЕКУЩИЙ" : "";
+                user.append("  ").append(j + 1).append(". ")
+                        .append(tc.steps().get(j)).append(marker).append("\n");
+            }
+            user.append("\n");
+        }
+
         user.append("Шаг #").append(stepIndex + 1).append(": ").append(stepText).append("\n\n");
+
+        if (stepIndex + 1 < tc.steps().size()) {
+            user.append("Последующие шаги (для ПРАВИЛА 8.1: если в них упоминается сравнение — "
+                    + "сними snapshot СРАЗУ на текущем шаге):\n");
+            for (int j = stepIndex + 1; j < tc.steps().size(); j++) {
+                user.append("- Шаг #").append(j + 1).append(": ")
+                        .append(tc.steps().get(j)).append("\n");
+            }
+            user.append("\n");
+        }
 
         if (tc.answers() != null && !tc.answers().isEmpty()) {
             user.append("Ранее пользователь ответил на уточнения в этом кейсе:\n");
