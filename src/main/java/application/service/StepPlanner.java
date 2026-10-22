@@ -6,6 +6,7 @@ import application.dto.Dtos.ParsedTestCase;
 import application.dto.Dtos.StepEnrichment;
 import application.exception.GenerationException;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -129,10 +130,17 @@ public class StepPlanner {
         return out;
     }
 
-    public Plan planStep(ParsedTestCase tc, int stepIndex, String stepText, String domSnapshot,
-                         String apiBaseUrl, List<StepEnrichment> previousEnrichments,
-                         String lastResponseBody, Map<String, String> lastResponseHeaders,
-                         Integer lastStatusCode) {
+    /**
+     * FIX (массив планов): модель может вернуть как одиночный объект {@code {...}},
+     * так и массив {@code [{...}, {...}]}. Пример: шаг «нет ключей hourly, daily,
+     * minutely_15» → три assertBodyAbsent.
+     *
+     * @return список планов; каждый будет выполнен последовательно в HybridCaseRunner.
+     */
+    public List<Plan> planStep(ParsedTestCase tc, int stepIndex, String stepText, String domSnapshot,
+                               String apiBaseUrl, List<StepEnrichment> previousEnrichments,
+                               String lastResponseBody, Map<String, String> lastResponseHeaders,
+                               Integer lastStatusCode) {
         StringBuilder user = new StringBuilder();
         user.append("Тип кейса: ").append(tc.type()).append("\n");
         user.append("Тест-кейс: ").append(tc.id()).append(" — ").append(tc.title()).append("\n");
@@ -153,7 +161,7 @@ public class StepPlanner {
             for (StepEnrichment e : previousEnrichments) {
                 user.append("- Шаг ").append(e.stepIndex() + 1)
                         .append(": ").append(e.action()).append(" → ")
-                        .append(e.detail()).append("\n");
+                        .append(truncate(e.detail(), 500)).append("\n");
             }
             user.append("\nДля проверки тела используй assertBody, отсутствия подстроки — ")
                     .append("assertBodyAbsent, заголовка — assertHeader, отсутствия заголовка — ")
@@ -161,8 +169,9 @@ public class StepPlanner {
         }
 
         if (domSnapshot != null && !domSnapshot.isBlank()) {
-            user.append("DOM-СНАПШОТ страницы (полный, только интерактивные элементы с атрибутами):\n");
-            user.append(domSnapshot).append("\n");
+            user.append("DOM-СНАПШОТ страницы (только интерактивные элементы с атрибутами):\n");
+            user.append(domSnapshot.length() > 40000 ? domSnapshot.substring(0, 40000) : domSnapshot)
+                    .append("\n");
         }
 
         if (apiBaseUrl == null || apiBaseUrl.isBlank()) {
@@ -191,41 +200,64 @@ public class StepPlanner {
             }
         }
         if (lastResponseBody != null && !lastResponseBody.isBlank()) {
-            user.append("\nТело последнего ответа API (полное):\n")
-                    .append(lastResponseBody).append("\n");
+            user.append("\nТело последнего ответа API:\n")
+                    .append(lastResponseBody.length() > 12000
+                            ? lastResponseBody.substring(0, 12000) : lastResponseBody)
+                    .append("\n");
         }
 
-        String userText = user.toString();
-        int maxInputChars = appProps.getPlanner().getMaxInputChars();
-        if (maxInputChars > 0 && userText.length() > maxInputChars) {
-            throw new PlannerInputTooLargeException(
-                    "Вход планера слишком большой: " + userText.length()
-                            + " символов (лимит " + maxInputChars + "). "
-                            + "Сузьте startUrl (конкретная страница/раздел) или укажите "
-                            + "селектор контейнера в ответе на уточнение.");
-        }
-
-        String response = openRouter.complete(appProps.getPrompts().getPlanStep(), userText);
+        String response = openRouter.complete(appProps.getPrompts().getPlanStep(), user.toString());
         String cleaned = response.replaceAll("^```json\\s*", "").replaceAll("```\\s*$", "").trim();
+        return parsePlans(cleaned, tc.type());
+    }
+
+    /**
+     * FIX (массив планов): принимает и одиночный объект {@code {...}}, и массив
+     * {@code [{...}, {...}]}. Каждый элемент валидируется через {@link Plan#validateAgainst}.
+     */
+    private List<Plan> parsePlans(String cleaned, String caseType) {
         try {
-            Map<String, Object> map = mapper.readValue(cleaned, new TypeReference<>() {
-            });
-            List<ElementTarget> elements = parseElements(map.get("elements"));
-            Plan plan = new Plan(
-                    str(map.get("operation")), str(map.get("locator")), str(map.get("value")),
-                    str(map.get("method")), str(map.get("path")), str(map.get("bodyJson")),
-                    parseExpectedStatus(map.get("expectedStatus")),
-                    str(map.get("topicKey")), str(map.get("question")), str(map.get("reason")),
-                    str(map.get("locatorStrategy")), str(map.get("elementRole")),
-                    str(map.get("elementName")), str(map.get("locatorAlternatives")),
-                    elements, str(map.get("requestHeaders"))
-            );
-            return plan.validateAgainst(tc.type());
+            JsonNode root = mapper.readTree(cleaned);
+            List<Plan> plans = new ArrayList<>();
+            if (root.isArray()) {
+                for (JsonNode node : root) {
+                    plans.add(toPlan(node).validateAgainst(caseType));
+                }
+                if (plans.isEmpty()) {
+                    throw new GenerationException(
+                            "Модель вернула пустой массив планов");
+                }
+                return plans;
+            }
+            // Одиночный объект
+            plans.add(toPlan(root).validateAgainst(caseType));
+            return plans;
         } catch (GenerationException e) {
             throw e;
         } catch (Exception e) {
             throw new GenerationException("Модель вернула невалидный JSON: " + e.getMessage(), e);
         }
+    }
+
+    private Plan toPlan(JsonNode node) {
+        if (node == null || !node.isObject()) {
+            throw new GenerationException(
+                    "Ожидался JSON-объект плана, получено: "
+                            + (node == null ? "null" : node.getNodeType()));
+        }
+        @SuppressWarnings("unchecked")
+        Map<String, Object> map = mapper.convertValue(node, new TypeReference<>() {
+        });
+        List<ElementTarget> elements = parseElements(map.get("elements"));
+        return new Plan(
+                str(map.get("operation")), str(map.get("locator")), str(map.get("value")),
+                str(map.get("method")), str(map.get("path")), str(map.get("bodyJson")),
+                parseExpectedStatus(map.get("expectedStatus")),
+                str(map.get("topicKey")), str(map.get("question")), str(map.get("reason")),
+                str(map.get("locatorStrategy")), str(map.get("elementRole")),
+                str(map.get("elementName")), str(map.get("locatorAlternatives")),
+                elements, str(map.get("requestHeaders"))
+        );
     }
 
     private List<ElementTarget> parseElements(Object raw) {
@@ -265,13 +297,8 @@ public class StepPlanner {
         return o == null ? null : o.toString();
     }
 
-    /**
-     * Сигнал о переполнении входа планера — конвертируется HybridCaseRunner
-     * в needClarification с topicKey="context_overflow".
-     */
-    public static final class PlannerInputTooLargeException extends RuntimeException {
-        public PlannerInputTooLargeException(String message) {
-            super(message);
-        }
+    private static String truncate(String s, int max) {
+        if (s == null) return "";
+        return s.length() <= max ? s : s.substring(0, max) + "…";
     }
 }
