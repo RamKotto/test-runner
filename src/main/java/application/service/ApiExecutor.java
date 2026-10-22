@@ -3,6 +3,7 @@ package application.service;
 import application.config.AppProperties;
 import application.dto.Dtos.StepEnrichment;
 import application.exception.AssertionFailure;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.restassured.RestAssured;
 import io.restassured.response.Response;
@@ -34,6 +35,9 @@ public class ApiExecutor {
                                 Integer responseStatusCode) {
     }
 
+    public record SnapshotResult(StepEnrichment enrichment, String key, String value) {
+    }
+
     public ApiStepResult executeStep(int stepIndex,
                                      StepPlanner.Plan plan,
                                      String apiBaseUrl,
@@ -44,6 +48,18 @@ public class ApiExecutor {
                                      Integer lastStatusCode) {
 
         String op = plan.operation() == null ? "" : plan.operation().toLowerCase();
+
+        // ---- snapshotApiValue ----
+        if ("snapshotapivalue".equals(op)) {
+            throw new IllegalStateException(
+                    "snapshotApiValue обрабатывается отдельным методом snapshotApiValue(...)");
+        }
+
+        // ---- assertApiValueEqualsSnapshot ----
+        if ("assertapivalueequalssnapshot".equals(op)) {
+            throw new IllegalStateException(
+                    "assertApiValueEqualsSnapshot обрабатывается отдельным методом");
+        }
 
         if ("assertbody".equals(op)) {
             String expected = plan.value();
@@ -335,6 +351,127 @@ public class ApiExecutor {
                 body, responseHeaders, actual);
     }
 
+    /**
+     * Снимок JSON-значения по JSONPath {@code plan.jsonPath()} в named-слот
+     * {@code plan.snapshotKey()}. Требует тело предыдущего ответа ({@code lastResponseBody}).
+     */
+    public SnapshotResult snapshotApiValue(int stepIndex, StepPlanner.Plan plan,
+                                           String lastResponseBody) {
+        String key = requireSnapshotKey(plan.snapshotKey());
+        String path = plan.jsonPath();
+        if (path == null || path.isBlank()) {
+            throw new UiExecutor.LocatorNotResolved(
+                    "snapshotApiValue: не указан jsonPath (напр. `$.hourly.temperature_2m`)");
+        }
+        if (lastResponseBody == null || lastResponseBody.isBlank()) {
+            throw new AssertionFailure("snapshotApiValue: нет тела предыдущего ответа"
+                    + " (предыдущий apiCall пропущен или не выполнен)");
+        }
+        JsonNode root;
+        try {
+            root = mapper.readTree(lastResponseBody);
+        } catch (Exception e) {
+            throw new AssertionFailure("snapshotApiValue: невалидный JSON: " + e.getMessage());
+        }
+        JsonNode slice = root.at(path);
+        if (slice.isMissingNode()) {
+            throw new AssertionFailure("snapshotApiValue: jsonPath `" + path
+                    + "` не найден в теле ответа");
+        }
+        String canonical = canonicalize(slice);
+        String preview = truncate(canonical, 240);
+        String detail = "snapshotApiValue → snapshot[" + key + "] ← `" + path + "`\n"
+                + "   • length: " + canonical.length() + " chars\n"
+                + "   • preview: " + preview;
+        log.info("API-шаг {}: snapshotApiValue key={} path={} len={}",
+                stepIndex + 1, key, path, canonical.length());
+        return new SnapshotResult(
+                StepEnrichment.api(stepIndex, "snapshotApiValue", detail, null, null, null),
+                key, canonical);
+    }
+
+    /**
+     * Сравнивает текущий JSON-срез ({@code plan.jsonPath()}) со снимком
+     * {@code plan.snapshotKey()} из {@code snapshots}.
+     */
+    public ApiStepResult assertApiValueEqualsSnapshot(int stepIndex, StepPlanner.Plan plan,
+                                                      String lastResponseBody,
+                                                      Map<String, String> snapshots) {
+        String key = requireSnapshotKey(plan.snapshotKey());
+        String path = plan.jsonPath();
+        if (path == null || path.isBlank()) {
+            throw new UiExecutor.LocatorNotResolved(
+                    "assertApiValueEqualsSnapshot: не указан jsonPath");
+        }
+        if (lastResponseBody == null) {
+            throw new AssertionFailure("assertApiValueEqualsSnapshot: нет тела предыдущего ответа");
+        }
+        String reference = snapshots == null ? null : snapshots.get(key);
+        if (reference == null) {
+            throw new AssertionFailure("assertApiValueEqualsSnapshot: нет снимка с ключом `"
+                    + key + "` (snapshotApiValue на шаге-эталоне не выполнялся?)");
+        }
+        JsonNode root;
+        try {
+            root = mapper.readTree(lastResponseBody);
+        } catch (Exception e) {
+            throw new AssertionFailure("assertApiValueEqualsSnapshot: невалидный JSON");
+        }
+        JsonNode actualSlice = root.at(path);
+        if (actualSlice.isMissingNode()) {
+            throw new AssertionFailure("assertApiValueEqualsSnapshot: jsonPath `" + path
+                    + "` отсутствует в текущем ответе");
+        }
+        String actual = canonicalize(actualSlice);
+        boolean equals = reference.equals(actual);
+
+        StringBuilder detail = new StringBuilder("assertApiValueEqualsSnapshot")
+                .append("\n   • snapshotKey: `").append(key).append("`")
+                .append("\n   • jsonPath: `").append(path).append("`")
+                .append("\n   • expected length: ").append(reference.length())
+                .append("\n   • actual length: ").append(actual.length())
+                .append("\n   • ").append(equals ? "✅ equal" : "❌ differ");
+
+        if (!equals) {
+            String diff = firstDifference(reference, actual, 120);
+            detail.append("\n   • first difference:\n       ")
+                    .append(diff.replace("\n", "\n       "));
+            throw new AssertionFailure("assertApiValueEqualsSnapshot: значения по `" + path
+                    + "` (key=`" + key + "`) различаются");
+        }
+        log.info("API-шаг {}: assertApiValueEqualsSnapshot key={} ok", stepIndex + 1, key);
+        return new ApiStepResult(
+                StepEnrichment.api(stepIndex, "assertApiValueEqualsSnapshot",
+                        detail.toString(), null, null, truncateSample(lastResponseBody)),
+                lastResponseBody, null, null);
+    }
+
+    // ---- helpers ----
+
+    private static String canonicalize(JsonNode node) {
+        if (node == null) return "null";
+        return node.toString();
+    }
+
+    private static String firstDifference(String a, String b, int radius) {
+        int i = 0, n = Math.min(a.length(), b.length());
+        while (i < n && a.charAt(i) == b.charAt(i)) i++;
+        int from = Math.max(0, i - radius / 2);
+        int toA = Math.min(a.length(), i + radius / 2);
+        int toB = Math.min(b.length(), i + radius / 2);
+        return "expected: …" + a.substring(from, toA) + "…\n"
+                + "actual:   …" + b.substring(from, toB) + "…\n"
+                + "offset:   " + i;
+    }
+
+    private static String requireSnapshotKey(String k) {
+        if (k == null || k.isBlank()) {
+            throw new UiExecutor.LocatorNotResolved(
+                    "snapshotKey обязателен для операций snapshot/compare");
+        }
+        return k.trim();
+    }
+
     private Map<String, String> parseHeaders(String raw) {
         Map<String, String> out = new LinkedHashMap<>();
         if (raw == null || raw.isBlank()) return out;
@@ -415,6 +552,11 @@ public class ApiExecutor {
         int limit = appProps.getEnrichmentBodyLimit();
         if (limit <= 0 || body.length() <= limit) return body;
         return body.substring(0, limit) + "\n… (truncated at " + limit + " chars)";
+    }
+
+    private static String truncate(String s, int max) {
+        if (s == null) return "";
+        return s.length() <= max ? s : s.substring(0, max) + "…";
     }
 
     private String contextAround(String body, int matchStart, int matchLen, int radius) {

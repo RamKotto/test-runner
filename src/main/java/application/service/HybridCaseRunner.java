@@ -28,6 +28,10 @@ public class HybridCaseRunner {
     ) {
     }
 
+    private record ApiOpResult(StepEnrichment enrichment,
+                               ApiExecutor.ApiStepResult apiResult) {
+    }
+
     public Result run(ParsedTestCase tc, String startUrl, String apiBaseUrl) {
         return run(tc, startUrl, apiBaseUrl, 0);
     }
@@ -44,8 +48,9 @@ public class HybridCaseRunner {
         String lastBody = null;
         Map<String, String> lastHeaders = new LinkedHashMap<>();
         Integer lastStatus = null;
-
         boolean apiDataAvailable = false;
+
+        Map<String, String> snapshots = new LinkedHashMap<>();
 
         UiExecutor.UiSession uiSession = null;
         int fromStep = Math.max(0, startStep);
@@ -58,9 +63,8 @@ public class HybridCaseRunner {
                     String domSnapshot = uiSession != null
                             ? uiExecutor.snapshotForPlanning(uiSession)
                             : null;
-                    // FIX (массив планов): planStep теперь возвращает List<Plan>.
                     plans = planner.planStep(tc, i, step, domSnapshot, apiBaseUrl,
-                            enrichments, lastBody, lastHeaders, lastStatus);
+                            enrichments, lastBody, lastHeaders, lastStatus, snapshots);
                 } catch (GenerationException ge) {
                     failures.add("Шаг " + (i + 1) + ": " + ge.getMessage());
                     enrichments.add(new StepEnrichment(i, "planning-error",
@@ -68,7 +72,6 @@ public class HybridCaseRunner {
                     continue;
                 }
 
-                // Обрабатываем все планы шага последовательно.
                 for (StepPlanner.Plan plan : plans) {
                     if (plan.isSkip()) {
                         String reason = plan.reason() == null ? "" : plan.reason();
@@ -104,10 +107,7 @@ public class HybridCaseRunner {
                     boolean isUiOp = StepPlanner.UI_OPS.contains(op);
                     boolean isApiOp = StepPlanner.API_OPS.contains(op);
 
-                    boolean isApiAssert = Set.of("assertbody", "assertbodyabsent",
-                            "assertheader", "assertheaderabsent",
-                            "assertstatus", "parsejson").contains(op);
-                    if (isApiAssert && !apiDataAvailable) {
+                    if (isApiOp && isApiAssert(op) && !apiDataAvailable) {
                         enrichments.add(new StepEnrichment(i, op,
                                 "⏭ SKIP (каскад): нет данных от предыдущего apiCall"));
                         continue;
@@ -129,45 +129,33 @@ public class HybridCaseRunner {
 
                     if (isUiOp) {
                         if (uiSession == null) {
-                            String resolved = resolveStartUrl(tc, startUrl);
-                            if (resolved == null || resolved.isBlank()
-                                    || "SKIP".equalsIgnoreCase(resolved.trim())
-                                    || !(resolved.startsWith("http://") || resolved.startsWith("https://"))) {
-                                String topicKey = "start_url";
-                                if (isSkippedInThisCase(tc, topicKey)
-                                        || findAnswerInThisCase(tc, topicKey) != null) {
-                                    enrichments.add(new StepEnrichment(i, "skip",
-                                            "⏭ SKIP по ответу (topic=start_url)"));
-                                    continue;
-                                }
-                                clarifications.add(new Clarification(tc.id(), i,
-                                        withTopic("Шаг " + (i + 1) + " («" + step
-                                                        + "»): укажите стартовый URL (http(s)://...) для UI-кейса",
-                                                topicKey),
-                                        "startUrl не передан в RunRequest и не дан в ответах",
-                                        "DATA_MISSING", topicKey));
+                            StartUrlOutcome su = resolveOrClarifyStartUrl(tc, startUrl, i, step,
+                                    enrichments);
+                            if (su.clarification() != null) {
+                                clarifications.add(su.clarification());
                                 return new Result(new ExecutionOutcome(
                                         tc.id(), tc.sourceFilename(), "NEEDS_CLARIFICATION",
                                         "Прервано на шаге " + (i + 1), enrichments),
                                         clarifications, i);
                             }
-                            uiSession = uiExecutor.newSession(resolved);
+                            if (su.isSkip()) continue;
+                            uiSession = uiExecutor.newSession(su.url());
                         }
+
                         try {
                             uiExecutor.dumpHtml(uiSession, tc.id(), i);
-                            StepEnrichment e = uiExecutor.executeStep(
-                                    uiSession, i, plan, uiExecutor.currentUrl(uiSession));
+                            StepEnrichment e = executeUiOp(uiSession, i, plan, snapshots);
                             enrichments.add(e);
                         } catch (AssertionFailure af) {
-                            enrichments.add(new StepEnrichment(i, op,
-                                    "❌ " + af.getMessage()));
+                            enrichments.add(new StepEnrichment(i, op, "❌ " + af.getMessage()));
                             failures.add("Шаг " + (i + 1) + ": " + af.getMessage());
                         } catch (UiExecutor.LocatorNotResolved lnr) {
                             String topicKey = normalizeTopic(plan.topicKey(), lnr.getMessage());
                             if (isSkippedInThisCase(tc, topicKey)
                                     || findAnswerInThisCase(tc, topicKey) != null) {
                                 enrichments.add(new StepEnrichment(i, "skip",
-                                        "⏭ SKIP по ответу (topic=" + topicKey + "): " + lnr.getMessage()));
+                                        "⏭ SKIP по ответу (topic=" + topicKey + "): "
+                                                + lnr.getMessage()));
                                 continue;
                             }
                             clarifications.add(new Clarification(tc.id(), i,
@@ -187,18 +175,26 @@ public class HybridCaseRunner {
                                     "❌ Необработанная ошибка UI: " + ex.getMessage()));
                             failures.add("Шаг " + (i + 1) + ": " + ex.getMessage());
                         }
-                    } else if (isApiOp) {
+                        continue;
+                    }
+
+                    if (isApiOp) {
                         try {
-                            ApiExecutor.ApiStepResult r = apiExecutor.executeStep(
-                                    i, plan, apiBaseUrl, Map.of(), Map.of(),
-                                    lastBody, lastHeaders, lastStatus);
+                            ApiOpResult r = executeApiOp(i, plan, apiBaseUrl,
+                                    lastBody, lastHeaders, lastStatus, snapshots);
                             enrichments.add(r.enrichment());
-                            if (r.responseBody() != null) lastBody = r.responseBody();
-                            if (r.responseHeaders() != null && !r.responseHeaders().isEmpty())
-                                lastHeaders = r.responseHeaders();
-                            if (r.responseStatusCode() != null) {
-                                lastStatus = r.responseStatusCode();
-                                apiDataAvailable = true;
+                            if (r.apiResult() != null) {
+                                if (r.apiResult().responseBody() != null) {
+                                    lastBody = r.apiResult().responseBody();
+                                }
+                                if (r.apiResult().responseHeaders() != null
+                                        && !r.apiResult().responseHeaders().isEmpty()) {
+                                    lastHeaders = r.apiResult().responseHeaders();
+                                }
+                                if (r.apiResult().responseStatusCode() != null) {
+                                    lastStatus = r.apiResult().responseStatusCode();
+                                    apiDataAvailable = true;
+                                }
                             }
                         } catch (AssertionFailure af) {
                             if ("apicall".equals(op) && isConfigError(af.getMessage())) {
@@ -234,7 +230,8 @@ public class HybridCaseRunner {
                             if (isSkippedInThisCase(tc, topicKey)
                                     || findAnswerInThisCase(tc, topicKey) != null) {
                                 enrichments.add(new StepEnrichment(i, "skip",
-                                        "⏭ SKIP по ответу (topic=" + topicKey + "): " + lnr.getMessage()));
+                                        "⏭ SKIP по ответу (topic=" + topicKey + "): "
+                                                + lnr.getMessage()));
                                 continue;
                             }
                             clarifications.add(new Clarification(tc.id(), i,
@@ -251,12 +248,13 @@ public class HybridCaseRunner {
                                     "❌ Необработанная ошибка API: " + ex.getMessage()));
                             failures.add("Шаг " + (i + 1) + ": " + ex.getMessage());
                         }
-                    } else {
-                        enrichments.add(new StepEnrichment(i, "unknown-op",
-                                "❌ Неизвестная операция: " + op));
-                        failures.add("Шаг " + (i + 1) + ": неизвестная операция '" + op + "'");
+                        continue;
                     }
-                } // конец for (Plan plan : plans)
+
+                    enrichments.add(new StepEnrichment(i, "unknown-op",
+                            "❌ Неизвестная операция: " + op));
+                    failures.add("Шаг " + (i + 1) + ": неизвестная операция '" + op + "'");
+                }
             }
 
             if (!failures.isEmpty()) {
@@ -267,7 +265,6 @@ public class HybridCaseRunner {
                         enrichments), List.of(), tc.steps().size());
             }
 
-            // FIX: если все enrichments — skip, помечаем кейс как SKIPPED, а не PASSED.
             boolean allSkipped = !enrichments.isEmpty() && enrichments.stream()
                     .allMatch(e -> "skip".equalsIgnoreCase(e.action()));
             if (allSkipped) {
@@ -288,6 +285,94 @@ public class HybridCaseRunner {
                 }
             }
         }
+    }
+
+    // =========================== helpers ===========================
+
+    private static boolean isApiAssert(String op) {
+        return Set.of("assertbody", "assertbodyabsent",
+                "assertheader", "assertheaderabsent",
+                "assertstatus", "parsejson",
+                "assertapivalueequalssnapshot").contains(op);
+    }
+
+    private record StartUrlOutcome(String url, boolean isSkip, Clarification clarification) {
+        static StartUrlOutcome ok(String url) {
+            return new StartUrlOutcome(url, false, null);
+        }
+
+        static StartUrlOutcome skip() {
+            return new StartUrlOutcome(null, true, null);
+        }
+
+        static StartUrlOutcome clarify(Clarification c) {
+            return new StartUrlOutcome(null, false, c);
+        }
+    }
+
+    private StartUrlOutcome resolveOrClarifyStartUrl(ParsedTestCase tc, String startUrl,
+                                                     int i, String step,
+                                                     List<StepEnrichment> enrichments) {
+        String resolved = resolveStartUrl(tc, startUrl);
+        boolean valid = resolved != null && !resolved.isBlank()
+                && !"SKIP".equalsIgnoreCase(resolved.trim())
+                && (resolved.startsWith("http://") || resolved.startsWith("https://"));
+        if (valid) return StartUrlOutcome.ok(resolved);
+
+        String topicKey = "start_url";
+        if (isSkippedInThisCase(tc, topicKey)
+                || findAnswerInThisCase(tc, topicKey) != null) {
+            enrichments.add(new StepEnrichment(i, "skip",
+                    "⏭ SKIP по ответу (topic=start_url)"));
+            return StartUrlOutcome.skip();
+        }
+        Clarification c = new Clarification(tc.id(), i,
+                withTopic("Шаг " + (i + 1) + " («" + step
+                        + "»): укажите стартовый URL (http(s)://...) для UI-кейса", topicKey),
+                "startUrl не передан в RunRequest и не дан в ответах",
+                "DATA_MISSING", topicKey);
+        return StartUrlOutcome.clarify(c);
+    }
+
+    private StepEnrichment executeUiOp(UiExecutor.UiSession uiSession, int i,
+                                       StepPlanner.Plan plan,
+                                       Map<String, String> snapshots) {
+        String op = plan.operation() == null ? "" : plan.operation().toLowerCase();
+        return switch (op) {
+            case "snapshotuitext" -> {
+                UiExecutor.SnapshotResult sr = uiExecutor.snapshotUiText(uiSession, i, plan);
+                snapshots.put(sr.key(), sr.value());
+                yield sr.enrichment();
+            }
+            case "assertuitextequalssnapshot" -> uiExecutor.assertUiTextEqualsSnapshot(uiSession, i, plan, snapshots);
+            default -> uiExecutor.executeStep(uiSession, i, plan,
+                    uiExecutor.currentUrl(uiSession));
+        };
+    }
+
+    private ApiOpResult executeApiOp(int i, StepPlanner.Plan plan, String apiBaseUrl,
+                                     String lastBody, Map<String, String> lastHeaders,
+                                     Integer lastStatus, Map<String, String> snapshots) {
+        String op = plan.operation() == null ? "" : plan.operation().toLowerCase();
+        return switch (op) {
+            case "snapshotapivalue" -> {
+                ApiExecutor.SnapshotResult sr =
+                        apiExecutor.snapshotApiValue(i, plan, lastBody);
+                snapshots.put(sr.key(), sr.value());
+                yield new ApiOpResult(sr.enrichment(), null);
+            }
+            case "assertapivalueequalssnapshot" -> {
+                ApiExecutor.ApiStepResult r =
+                        apiExecutor.assertApiValueEqualsSnapshot(i, plan, lastBody, snapshots);
+                yield new ApiOpResult(r.enrichment(), null);
+            }
+            default -> {
+                ApiExecutor.ApiStepResult r = apiExecutor.executeStep(
+                        i, plan, apiBaseUrl, Map.of(), Map.of(),
+                        lastBody, lastHeaders, lastStatus);
+                yield new ApiOpResult(r.enrichment(), r);
+            }
+        };
     }
 
     private static boolean isConfigError(String msg) {

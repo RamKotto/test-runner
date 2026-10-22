@@ -13,6 +13,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 @Slf4j
 @Service
@@ -44,11 +45,6 @@ public class UiExecutor {
         return new UiSession(ctx, page);
     }
 
-    /**
-     * Полный DOM-снапшот без обрезки по количеству элементов, длине текста и классу.
-     * Дедупликация убрана намеренно: две кнопки «Сохранить» должны попасть в снапшот
-     * обе, чтобы агент мог запросить уточнение по неоднозначности.
-     */
     public String snapshotForPlanning(UiSession session) {
         try {
             return (String) session.page().evaluate("""
@@ -240,6 +236,115 @@ public class UiExecutor {
         }
     }
 
+    // ---- snapshot/compare UI ----
+
+    public SnapshotResult snapshotUiText(UiSession session, int stepIndex, StepPlanner.Plan plan) {
+        String key = requireSnapshotKey(plan.snapshotKey());
+        List<ElementInfo> elements = resolveAllElements(session.page(), plan, false);
+        if (elements.size() != 1) {
+            throw new LocatorNotResolved(
+                    "snapshotUiText: ожидался ровно 1 элемент, найдено " + elements.size()
+                            + " — уточните локатор");
+        }
+        ElementInfo el = elements.get(0);
+        String attr = plan.attribute() == null || plan.attribute().isBlank()
+                ? "innerText" : plan.attribute();
+        String value = readUiValue(session.page(), el.locator(), attr);
+        String detail = "snapshotUiText → snapshot[" + key + "] ← `" + el.locator()
+                + "` [" + attr + "]\n   • length: " + value.length()
+                + "\n   • preview: " + truncate(value, 240);
+        log.info("UI-шаг {}: snapshotUiText key={} locator={} attr={} len={}",
+                stepIndex + 1, key, el.locator(), attr, value.length());
+        return new SnapshotResult(
+                StepEnrichment.ui(stepIndex, "snapshotUiText", detail, elements),
+                key, value);
+    }
+
+    public StepEnrichment assertUiTextEqualsSnapshot(UiSession session, int stepIndex,
+                                                     StepPlanner.Plan plan,
+                                                     Map<String, String> snapshots) {
+        String key = requireSnapshotKey(plan.snapshotKey());
+        String reference = snapshots == null ? null : snapshots.get(key);
+        if (reference == null) {
+            throw new AssertionFailure("assertUiTextEqualsSnapshot: нет снимка `" + key + "`");
+        }
+        List<ElementInfo> elements = resolveAllElements(session.page(), plan, false);
+        if (elements.size() != 1) {
+            throw new LocatorNotResolved(
+                    "assertUiTextEqualsSnapshot: ожидался ровно 1 элемент, найдено "
+                            + elements.size());
+        }
+        ElementInfo el = elements.get(0);
+        String attr = plan.attribute() == null || plan.attribute().isBlank()
+                ? "innerText" : plan.attribute();
+        String actual = readUiValue(session.page(), el.locator(), attr);
+        boolean equals = reference.equals(actual);
+
+        StringBuilder detail = new StringBuilder("assertUiTextEqualsSnapshot")
+                .append("\n   • snapshotKey: `").append(key).append("`")
+                .append("\n   • locator: `").append(el.locator()).append("`")
+                .append("\n   • attribute: ").append(attr)
+                .append("\n   • expected length: ").append(reference.length())
+                .append("\n   • actual length: ").append(actual.length())
+                .append("\n   • ").append(equals ? "✅ equal" : "❌ differ");
+        if (!equals) {
+            detail.append("\n   • expected: \"")
+                    .append(escapeQuotes(truncateSmart(reference, 300))).append("\"")
+                    .append("\n   • actual:   \"")
+                    .append(escapeQuotes(truncateSmart(actual, 300))).append("\"");
+            throw new AssertionFailure("assertUiTextEqualsSnapshot: значения различаются\n"
+                    + detail);
+        }
+        log.info("UI-шаг {}: assertUiTextEqualsSnapshot key={} ok", stepIndex + 1, key);
+        return StepEnrichment.ui(stepIndex, "assertUiTextEqualsSnapshot",
+                detail.toString(), elements);
+    }
+
+    private String readUiValue(Page page, String locator, String attr) {
+        Locator loc = page.locator(locator).first();
+        try {
+            return switch (attr) {
+                case "innerText" -> {
+                    String t = loc.innerText();
+                    yield t == null ? "" : t.trim().replaceAll("\\s+", " ");
+                }
+                case "textContent" -> {
+                    String t = loc.textContent();
+                    yield t == null ? "" : t.trim().replaceAll("\\s+", " ");
+                }
+                case "value" -> {
+                    Object v = loc.evaluate("e => e.value == null ? '' : String(e.value)");
+                    yield v == null ? "" : v.toString();
+                }
+                default -> {
+                    Object v = loc.evaluate("(e, a) => e.getAttribute(a) || ''", attr);
+                    yield v == null ? "" : v.toString();
+                }
+            };
+        } catch (Exception e) {
+            throw new AssertionFailure("не удалось прочитать `" + attr + "` у `"
+                    + locator + "`: " + e.getMessage());
+        }
+    }
+
+    private static String requireSnapshotKey(String k) {
+        if (k == null || k.isBlank()) {
+            throw new LocatorNotResolved(
+                    "snapshotKey обязателен для операций snapshot/compare");
+        }
+        return k.trim();
+    }
+
+    private static String truncate(String s, int max) {
+        if (s == null) return "";
+        return s.length() <= max ? s : s.substring(0, max) + "…";
+    }
+
+    public record SnapshotResult(StepEnrichment enrichment, String key, String value) {
+    }
+
+    // ---- существующие helpers ----
+
     private void appendElementDetail(StringBuilder sb, ElementInfo el) {
         sb.append("     locator: `").append(el.locator()).append("`\n");
         if (el.count() != null) sb.append("     matches: ").append(el.count()).append("\n");
@@ -264,12 +369,6 @@ public class UiExecutor {
         }
     }
 
-    /**
-     * @param strictAmbiguity true для мутирующих операций (click/fill): если локатор
-     *                        матчит несколько элементов, бросаем LocatorNotResolved
-     *                        с перечнем кандидатов — это уточнение ui_locator_<role>.
-     *                        false для assertText: проходим по всем совпадениям.
-     */
     public List<ElementInfo> resolveAllElements(Page page, StepPlanner.Plan plan,
                                                 boolean strictAmbiguity) {
         List<StepPlanner.ElementTarget> targets = plan.effectiveElements();
@@ -291,7 +390,6 @@ public class UiExecutor {
                 throw new LocatorNotResolved("локатор `" + t.locator() + "` не найден в DOM");
             }
             if (strictAmbiguity && count > 1) {
-                // Неоднозначность: собираем кандидатов и требуем уточнения.
                 StringBuilder sb = new StringBuilder();
                 sb.append("локатор `").append(t.locator()).append("` матчит ")
                         .append(count).append(" элементов — уточните, какой использовать:\n");
@@ -517,10 +615,6 @@ public class UiExecutor {
         }
     }
 
-    /**
-     * LocatorNotResolved с опциональным roleKey — для стабильного topicKey
-     * "ui_locator_<role>" при неоднозначности локатора.
-     */
     public static final class LocatorNotResolved extends RuntimeException {
         private final String roleKey;
 

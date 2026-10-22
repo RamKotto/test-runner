@@ -23,11 +23,13 @@ import java.util.Set;
 public class StepPlanner {
 
     public static final Set<String> UI_OPS = Set.of(
-            "navigate", "click", "fill", "asserttext", "waitfortext", "assertpagetext");
+            "navigate", "click", "fill", "asserttext", "waitfortext", "assertpagetext",
+            "snapshotuitext", "assertuitextequalssnapshot");
 
     public static final Set<String> API_OPS = Set.of(
             "apicall", "assertbody", "assertheader", "assertstatus", "parsejson",
-            "assertbodyabsent", "assertheaderabsent");
+            "assertbodyabsent", "assertheaderabsent",
+            "snapshotapivalue", "assertapivalueequalssnapshot");
 
     private final OpenRouterClient openRouter;
     private final AppProperties appProps;
@@ -47,7 +49,10 @@ public class StepPlanner {
             String bodyJson, Integer expectedStatus, String topicKey, String question, String reason,
             String locatorStrategy, String elementRole, String elementName, String locatorAlternatives,
             List<ElementTarget> elements,
-            String requestHeaders
+            String requestHeaders,
+            String snapshotKey,
+            String jsonPath,
+            String attribute
     ) {
         public boolean needsClarification() {
             return "needClarification".equalsIgnoreCase(operation);
@@ -132,15 +137,16 @@ public class StepPlanner {
 
     /**
      * FIX (массив планов): модель может вернуть как одиночный объект {@code {...}},
-     * так и массив {@code [{...}, {...}]}. Пример: шаг «нет ключей hourly, daily,
-     * minutely_15» → три assertBodyAbsent.
-     *
-     * @return список планов; каждый будет выполнен последовательно в HybridCaseRunner.
+     * так и массив {@code [{...}, {...}]}.
+     * <p>
+     * FIX (сравнение между шагами): параметр {@code snapshots} передаёт модели
+     * уже снятые значения, чтобы она не пыталась снять заново и могла ссылаться
+     * на них в assert*EqualsSnapshot.
      */
     public List<Plan> planStep(ParsedTestCase tc, int stepIndex, String stepText, String domSnapshot,
                                String apiBaseUrl, List<StepEnrichment> previousEnrichments,
                                String lastResponseBody, Map<String, String> lastResponseHeaders,
-                               Integer lastStatusCode) {
+                               Integer lastStatusCode, Map<String, String> snapshots) {
         StringBuilder user = new StringBuilder();
         user.append("Тип кейса: ").append(tc.type()).append("\n");
         user.append("Тест-кейс: ").append(tc.id()).append(" — ").append(tc.title()).append("\n");
@@ -166,6 +172,17 @@ public class StepPlanner {
             user.append("\nДля проверки тела используй assertBody, отсутствия подстроки — ")
                     .append("assertBodyAbsent, заголовка — assertHeader, отсутствия заголовка — ")
                     .append("assertHeaderAbsent, валидности JSON — parseJson, статуса — assertStatus.\n\n");
+        }
+
+        if (snapshots != null && !snapshots.isEmpty()) {
+            user.append("Уже сделанные снимки значений (snapshotKey → preview):\n");
+            for (Map.Entry<String, String> e : snapshots.entrySet()) {
+                user.append("- ").append(e.getKey()).append(": ")
+                        .append(truncate(e.getValue(), 200)).append("\n");
+            }
+            user.append("\nДля сравнения значений между шагами используй ")
+                    .append("assertApiValueEqualsSnapshot / assertUiTextEqualsSnapshot ")
+                    .append("с тем же snapshotKey.\n\n");
         }
 
         if (domSnapshot != null && !domSnapshot.isBlank()) {
@@ -211,10 +228,6 @@ public class StepPlanner {
         return parsePlans(cleaned, tc.type());
     }
 
-    /**
-     * FIX (массив планов): принимает и одиночный объект {@code {...}}, и массив
-     * {@code [{...}, {...}]}. Каждый элемент валидируется через {@link Plan#validateAgainst}.
-     */
     private List<Plan> parsePlans(String cleaned, String caseType) {
         try {
             JsonNode root = mapper.readTree(cleaned);
@@ -229,7 +242,6 @@ public class StepPlanner {
                 }
                 return plans;
             }
-            // Одиночный объект
             plans.add(toPlan(root).validateAgainst(caseType));
             return plans;
         } catch (GenerationException e) {
@@ -256,7 +268,8 @@ public class StepPlanner {
                 str(map.get("topicKey")), str(map.get("question")), str(map.get("reason")),
                 str(map.get("locatorStrategy")), str(map.get("elementRole")),
                 str(map.get("elementName")), str(map.get("locatorAlternatives")),
-                elements, str(map.get("requestHeaders"))
+                elements, str(map.get("requestHeaders")),
+                str(map.get("snapshotKey")), str(map.get("jsonPath")), str(map.get("attribute"))
         );
     }
 

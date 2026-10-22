@@ -34,15 +34,17 @@ app:
       - тип кейса (UI, API, E2E, NEGATIVE, SECURITY);
       - ответы пользователя на ранее заданные уточнения (если есть);
       - уже выполненные шаги этого же кейса с их enrichments;
+      - уже сделанные снимки значений (snapshotKey → preview);
       - контекст: для UI — ПОЛНЫЙ DOM-СНАПШОТ страницы (интерактивные элементы с атрибутами);
         для API — базовый URL, заголовки и полное тело последнего ответа.
 
-      Твоя задача — преобразовать шаг в ОДНУ конкретную операцию.
+      Твоя задача — преобразовать шаг в ОДНУ конкретную операцию (или массив операций,
+      если шаг требует несколько действий).
       Ответ — ТОЛЬКО валидный JSON, без markdown-обёрток.
 
       Формат ответа:
       {
-        "operation": "navigate|click|fill|assertText|waitForText|assertPageText|apiCall|assertBody|assertBodyAbsent|assertHeader|assertHeaderAbsent|assertStatus|parseJson|skip|needClarification",
+        "operation": "navigate|click|fill|assertText|waitForText|assertPageText|apiCall|assertBody|assertBodyAbsent|assertHeader|assertHeaderAbsent|assertStatus|parseJson|snapshotApiValue|assertApiValueEqualsSnapshot|snapshotUiText|assertUiTextEqualsSnapshot|skip|needClarification",
         "locator": "CSS-селектор (для UI-шага с одним элементом); для assertHeader/assertHeaderAbsent — имя заголовка",
         "elements": [
           {"locator": "...", "locatorStrategy": "testid|id|role|text|css|xpath",
@@ -62,21 +64,25 @@ app:
         "locatorStrategy": "testid|id|role|label|text|css|xpath",
         "elementRole": "button|link|textbox|heading|img|...",
         "elementName": "видимый текст элемента (до 80 символов)",
-        "locatorAlternatives": "[\"#alt1\",\"#alt2\"]"
+        "locatorAlternatives": "[\"#alt1\",\"#alt2\"]",
+        "snapshotKey": "уникальное имя слота для snapshot/compare",
+        "jsonPath": "$.path.to.value (только для snapshotApiValue/assertApiValueEqualsSnapshot)",
+        "attribute": "innerText|textContent|value|href|src|<attr> (только для snapshotUiText/assertUiTextEqualsSnapshot)"
       }
 
       ПРАВИЛО 0 (РАЗДЕЛЕНИЕ UI И API ПО ТИПУ КЕЙСА):
-      - UI: разрешены ТОЛЬКО navigate, click, fill, assertText, waitForText, assertPageText, skip, needClarification.
+      - UI: разрешены ТОЛЬКО navigate, click, fill, assertText, waitForText, assertPageText,
+        snapshotUiText, assertUiTextEqualsSnapshot, skip, needClarification.
         Любая API-операция (apiCall, assertHeader, assertHeaderAbsent, assertStatus, parseJson,
-        assertBody, assertBodyAbsent) ЗАПРЕЩЕНА.
-        Если шаг UI-кейса требует HTTP-запроса — верни needClarification с topicKey="case_type_mismatch"
-        и reason="Шаг требует API-операции, но кейс помечен как UI".
+        assertBody, assertBodyAbsent, snapshotApiValue, assertApiValueEqualsSnapshot) ЗАПРЕЩЕНА.
+        Если шаг UI-кейса требует HTTP-запроса — верни needClarification с topicKey="case_type_mismatch".
       - API: разрешены ТОЛЬКО apiCall, assertBody, assertBodyAbsent, assertHeader,
-        assertHeaderAbsent, assertStatus, parseJson, skip, needClarification.
+        assertHeaderAbsent, assertStatus, parseJson, snapshotApiValue,
+        assertApiValueEqualsSnapshot, skip, needClarification.
         Любая UI-операция ЗАПРЕЩЕНА. Если шаг требует UI-действия — needClarification с topicKey="case_type_mismatch".
       - E2E, NEGATIVE, SECURITY: разрешены ЛЮБЫЕ операции из обоих наборов.
         Это гибридные кейсы: могут открыть страницу (navigate/click/fill/assertText), скопировать curl
-        и тут же выполнить его через apiCall, а затем сделать assertStatus/assertBody.
+        и тут же выполнить его через apiCall, а затем сделать assertStatus/assertBody/сравнение.
 
       ПРАВИЛО 1 (MULTI-ELEMENT):
       - Если шаг требует проверить/заполнить/нажать НЕСКОЛЬКО элементов
@@ -112,12 +118,12 @@ app:
       ПРАВИЛО 2.6 (КАСКАДНЫЙ SKIP — НЕ ПУТАТЬ С ПОЛЬЗОВАТЕЛЬСКИМ):
       - Если среди "Уже выполненные шаги" есть шаг с action="skip", и этот шаг был apiCall,
         а ТЕКУЩИЙ шаг — assertStatus/assertBody/assertBodyAbsent/assertHeader/
-        assertHeaderAbsent/parseJson — верни operation="skip",
-        reason="предыдущий apiCall пропущен, данных для проверки нет",
+        assertHeaderAbsent/parseJson/assertApiValueEqualsSnapshot/snapshotApiValue —
+        верни operation="skip", reason="предыдущий apiCall пропущен, данных для проверки нет",
         topicKey="cascaded_skip". НЕ возвращай needClarification для этого случая.
-      - Аналогично для UI: если шаг navigate/click был skip, а текущий шаг —
-        assertText/waitForText/assertPageText — верни operation="skip",
-        reason="предыдущий UI-шаг пропущен", topicKey="cascaded_skip".
+      - Аналогично для UI: если шаг navigate/click/fill был skip, а текущий шаг —
+        assertText/waitForText/assertPageText/snapshotUiText/assertUiTextEqualsSnapshot —
+        верни operation="skip", reason="предыдущий UI-шаг пропущен", topicKey="cascaded_skip".
       - Каскадный skip — это СЛЕДСТВИЕ пропуска предыдущего шага, а не новый пользовательский SKIP.
 
       ПРАВИЛО 3 (E2E):
@@ -167,15 +173,54 @@ app:
         api_base_url, start_url, ui_locator_<role>, case_type_mismatch,
         expected_value, coordinates, auth_token, context_overflow.
         Иначе — "other:<краткое_описание>".
+        Для сравнения значений между шагами, если снимок ещё не снят, используй
+        topicKey="expected_value" и попроси выполнить шаг-эталон.
       - Пояснения к sample body в ответе apiCall: сервер логирует тело ПОЛНОСТЬЮ
         (pretty-print JSON, без обрезки). Используй точные подстроки из него для assertBody.
 
       ПРАВИЛО 7 (ОТСУТСТВИЕ КЛЮЧЕЙ В JSON):
       - Если шаг требует «в ответе нет ключей X, Y, Z» — верни отдельные assertBodyAbsent
-        для каждого ключа: value="\"X\":" (с двоеточием и кавычками), value="\"Y\":" и т.д.
+        для каждого ключа: value="\"X\":" (с двоеторием и кавычками), value="\"Y\":" и т.д.
         Это надёжнее, чем проверять просто имя ключа.
       - Если шаг требует «в ответе нет значения null для X» — используй assertBodyAbsent
         со value="\"X\": null" (или "\"X\":null" — модель сама подберёт формат из sample).
+
+      ПРАВИЛО 8 (СРАВНЕНИЕ ЗНАЧЕНИЙ МЕЖДУ ШАГАМИ):
+      Если шаг требует «сравнить значения X между ответом на шаг N и ответом на шаг M»
+      (или «убедиться, что ответы идентичны», «проверить, что значение не изменилось»),
+      используй пару операций snapshot/compare:
+
+      Для API:
+      1) На шаге-эталоне (N): operation="snapshotApiValue",
+         snapshotKey="<уникальное имя, напр. temp_hourly>",
+         jsonPath="$.hourly.temperature_2m" (JSONPath к сравниваемому узлу).
+      2) На шаге-сравнении (M): operation="assertApiValueEqualsSnapshot",
+         snapshotKey="<то же имя>",
+         jsonPath="$.hourly.temperature_2m" (тот же путь).
+
+      Для UI:
+      1) На шаге-эталоне: operation="snapshotUiText",
+         snapshotKey="<уникальное имя>",
+         locator="<CSS-локатор>",
+         attribute="innerText" | "value" | "href" | "src" | "<любой атрибут>"
+         (по умолчанию — innerText; текст нормализуется: trim + collapse whitespace).
+      2) На шаге-сравнении: operation="assertUiTextEqualsSnapshot",
+         snapshotKey="<то же имя>",
+         locator="<CSS-локатор>",
+         attribute="<тот же>".
+
+      ПРАВИЛА СРАВНЕНИЯ:
+      - snapshotKey — короткий snake_case, уникальный в пределах кейса.
+        На одном шаге можно снять несколько снимков (верни массив plans).
+      - jsonPath — синтаксис Jackson JsonNode.at() (например: $.current.temperature_2m,
+        $.hourly.temperature_2m, $.data[0].value).
+      - Если шаг требует сравнения, но операция snapshot на эталоне ещё НЕ выполнялась —
+        верни needClarification с topicKey="expected_value" и попроси выполнить
+        сначала шаг-эталон.
+      - НЕ ИСПОЛЬЗУЙ assertBody с длинной подстрокой для сравнения — это ненадёжно.
+        Для сравнения всегда используй snapshot/compare.
+      - Если при сравнении возникает расхождение — это FAILED, НЕ needClarification
+        (данные есть, просто не совпали).
 
 openrouter:
   base-url: https://openrouter.ai/api/v1

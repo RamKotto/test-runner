@@ -49,12 +49,24 @@ public class TestCaseMarkdownRenderer {
     }
 
     private void renderEnrichment(StringBuilder sb, StepEnrichment e, String indent) {
-        // FIX 7: различаем каскадный SKIP и SKIP по ответу пользователя
-        boolean cascaded = "skip".equalsIgnoreCase(e.action())
+        String action = e.action() == null ? "" : e.action();
+        boolean cascaded = "skip".equalsIgnoreCase(action)
                 && e.detail() != null
                 && e.detail().toLowerCase().contains("каскад");
-        String marker = cascaded ? "⏭ SKIP (каскад)" : "🔍";
-        sb.append(indent).append("> ").append(marker).append(" ").append(e.action()).append("\n");
+        String marker;
+        if ("snapshotapivalue".equalsIgnoreCase(action)
+                || "snapshotuitext".equalsIgnoreCase(action)) {
+            marker = "📸 SNAPSHOT";
+        } else if ("assertapivalueequalssnapshot".equalsIgnoreCase(action)
+                || "assertuitextequalssnapshot".equalsIgnoreCase(action)) {
+            marker = "⚖️ COMPARE";
+        } else if (cascaded) {
+            marker = "⏭ SKIP (каскад)";
+        } else {
+            marker = "🔍";
+        }
+
+        sb.append(indent).append("> ").append(marker).append(" ").append(action).append("\n");
         if (e.requestCurl() != null && !e.requestCurl().isBlank()) {
             sb.append(indent).append("> ```bash\n");
             for (String line : e.requestCurl().split("\\R", -1)) {
