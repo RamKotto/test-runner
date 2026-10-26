@@ -77,7 +77,6 @@
                         <argument>install</argument>
                         <argument>chromium</argument>
                     </arguments>
-                    <installBrowsers>true</installBrowsers>
                 </configuration>
             </plugin>
         </plugins>
