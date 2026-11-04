@@ -4,15 +4,20 @@ server:
 spring:
   application:
     name: test-runner
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/qa}
+    username: ${DB_USER:qa_app}
+    password: ${DB_PASSWORD:}
 
 app:
   storage:
     directory: ${user.dir}/data/enriched
-    base-url: http://localhost:8083
+    base-url: ${APP_STORAGE_BASE_URL:http://localhost:8083}
+  target:
+    allowed-hosts: ${APP_TARGET_ALLOWED_HOSTS:localhost}
   download:
     directory: ${user.dir}/data/downloaded
-    allowed-hosts:
-      - localhost
+    allowed-hosts: ${APP_DOWNLOAD_ALLOWED_HOSTS:localhost}
     connect-timeout-seconds: 10
     read-timeout-seconds: 300
   playwright:

@@ -10,9 +10,29 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
+/**
+ * Формирует Markdown-отчёты прогона: обогащённую версию тест-кейса и индекс результатов.
+ * <p>
+ * Место в конвейере: {@code RunController} вызывает {@link #renderEnriched} для каждого
+ * кейса, результат сохраняет {@link EnrichedStorageService}; {@link #renderIndex} строит
+ * индекс всех кейсов прогона, который сохраняется тем же способом.
+ */
 @Service
 public class TestCaseMarkdownRenderer {
 
+    /**
+     * Строит Markdown обогащённого кейса: заголовок с полями, предусловия, шаги
+     * с результатами выполнения и ожидаемый результат.
+     * <p>
+     * Записи {@code enrichments} группируются по {@code stepIndex} и выводятся под
+     * соответствующим шагом с отступом. Записи, индекс которых не совпадает ни с одним
+     * шагом, в отчёт не попадают. Раздел «Ожидаемый результат» выводится только
+     * при непустом значении.
+     *
+     * @param tc          разобранный тест-кейс
+     * @param enrichments записи выполнения; может быть {@code null}, тогда шаги выводятся без результатов
+     * @return Markdown-текст кейса
+     */
     public String renderEnriched(ParsedTestCase tc, List<StepEnrichment> enrichments) {
         Map<Integer, List<StepEnrichment>> byIndex = enrichments == null
                 ? Map.of()
@@ -48,6 +68,20 @@ public class TestCaseMarkdownRenderer {
         return sb.toString();
     }
 
+    /**
+     * Дописывает в отчёт одну запись выполнения в виде цитатного блока.
+     * <p>
+     * Маркер выбирается по действию: снимки ({@code snapshotApiValue}, {@code snapshotUiText})
+     * получают метку SNAPSHOT, сравнения ({@code assertApiValueEqualsSnapshot},
+     * {@code assertUiTextEqualsSnapshot}) получают метку COMPARE. Пропуск с «каскад»
+     * в тексте отчёта получает метку каскадного пропуска, остальные записи получают
+     * общий маркер. Curl, тело запроса, пример ответа и вложенные записи выводятся
+     * отдельными блоками, если они заданы. Вложенные записи получают уровень цитирования глубже.
+     *
+     * @param sb     отчёт, в который дописывается запись
+     * @param e      запись выполнения
+     * @param indent отступ, которым начинается каждая строка блока
+     */
     private void renderEnrichment(StringBuilder sb, StepEnrichment e, String indent) {
         String action = e.action() == null ? "" : e.action();
         boolean cascaded = "skip".equalsIgnoreCase(action)
@@ -106,6 +140,13 @@ public class TestCaseMarkdownRenderer {
         }
     }
 
+    /**
+     * Строит индекс прогона: по одной строке на кейс со ссылкой на его файл,
+     * статусом и текстом ошибки в скобках, если он есть.
+     *
+     * @param outcomes итоги кейсов прогона; может быть {@code null} или пустым
+     * @return Markdown-индекс; при пустом списке содержит строку «Пусто»
+     */
     public String renderIndex(List<ExecutionOutcome> outcomes) {
         StringBuilder sb = new StringBuilder("# Обогащённые тест-кейсы — индекс\n\n");
         if (outcomes == null || outcomes.isEmpty()) {

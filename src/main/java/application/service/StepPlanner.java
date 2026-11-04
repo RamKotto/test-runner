@@ -17,24 +17,59 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+/**
+ * Построитель планов шагов: формирует промпт, запрашивает план у LLM и разбирает ответ.
+ * <p>
+ * Место в конвейере: {@link HybridCaseRunner} вызывает {@link #planStep} для каждого шага.
+ * Модель получает контекст кейса, предыдущие результаты, снимки, DOM страницы и последний
+ * ответ API, а возвращает один план или массив планов в JSON. Каждый план проверяется
+ * на соответствие типу кейса ({@link Plan#validateAgainst}). Ответ, который нельзя разобрать
+ * или который нарушает правила, превращается в {@link GenerationException}.
+ */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class StepPlanner {
 
+    /**
+     * Операции, которые выполняет {@link UiExecutor}, в нижнем регистре.
+     */
     public static final Set<String> UI_OPS = Set.of(
             "navigate", "click", "fill", "asserttext", "waitfortext", "assertpagetext",
             "snapshotuitext", "assertuitextequalssnapshot");
 
+    /**
+     * Операции, которые выполняет {@link ApiExecutor}, в нижнем регистре.
+     */
     public static final Set<String> API_OPS = Set.of(
             "apicall", "assertbody", "assertheader", "assertstatus", "parsejson",
             "assertbodyabsent", "assertheaderabsent",
             "snapshotapivalue", "assertapivalueequalssnapshot");
 
+    /**
+     * Клиент LLM, через который отправляется промпт.
+     */
     private final OpenRouterClient openRouter;
+
+    /**
+     * Настройки приложения; из них берётся системный промпт планировщика.
+     */
     private final AppProperties appProps;
+
+    /**
+     * Маппер для разбора JSON-ответа модели.
+     */
     private final ObjectMapper mapper;
 
+    /**
+     * Цель действия над элементом страницы: локатор и данные для отчёта.
+     *
+     * @param locator         CSS- или Playwright-локатор
+     * @param locatorStrategy стратегия, которой получен локатор
+     * @param elementRole     роль элемента (кнопка, поле и т. п.)
+     * @param elementName     видимое имя элемента
+     * @param alternatives    запасные локаторы
+     */
     public record ElementTarget(
             String locator,
             String locatorStrategy,
@@ -44,6 +79,34 @@ public class StepPlanner {
     ) {
     }
 
+    /**
+     * План одного действия, предложенный моделью.
+     * <p>
+     * Поля соответствуют схеме ответа модели. Не все поля нужны каждой операции: например,
+     * {@code path} и {@code method} нужны только {@code apiCall}, {@code snapshotKey}
+     * только операциям снимков. Специальные значения {@code operation}: {@code skip} —
+     * пропуск шага, {@code needClarification} — запрос уточнения у пользователя.
+     *
+     * @param operation          имя операции
+     * @param locator            локатор одного элемента (альтернатива {@code elements})
+     * @param value              значение для fill, ожидаемый текст или статус
+     * @param method             HTTP-метод для apiCall
+     * @param path               путь или абсолютный URL для apiCall
+     * @param bodyJson           тело запроса в виде JSON-строки
+     * @param expectedStatus     ожидаемый HTTP-статус apiCall
+     * @param topicKey           тема вопроса для уточнения
+     * @param question           текст вопроса пользователю
+     * @param reason             причина пропуска или уточнения
+     * @param locatorStrategy    стратегия локатора
+     * @param elementRole        роль элемента
+     * @param elementName        имя элемента
+     * @param locatorAlternatives запасные локаторы в виде строки (JSON-массив или через запятую)
+     * @param elements           цели элементов для операций с несколькими элементами
+     * @param requestHeaders     заголовки запроса, по одному на строку в формате {@code Имя: значение}
+     * @param snapshotKey        ключ снимка
+     * @param jsonPath           путь внутри JSON-ответа
+     * @param attribute          атрибут элемента для снимка и сравнения UI
+     */
     public record Plan(
             String operation, String locator, String value, String method, String path,
             String bodyJson, Integer expectedStatus, String topicKey, String question, String reason,
@@ -54,24 +117,57 @@ public class StepPlanner {
             String jsonPath,
             String attribute
     ) {
+
+        /**
+         * Истина, если модель запросила уточнение у пользователя.
+         *
+         * @return {@code true} для операции {@code needClarification} без учёта регистра
+         */
         public boolean needsClarification() {
             return "needClarification".equalsIgnoreCase(operation);
         }
 
+        /**
+         * Истина, если шаг нужно пропустить.
+         *
+         * @return {@code true} для операции {@code skip} без учёта регистра
+         */
         public boolean isSkip() {
             return "skip".equalsIgnoreCase(operation);
         }
 
+        /**
+         * Истина, если операция относится к UI-исполнителю.
+         *
+         * @return {@code true}, если операция входит в {@link StepPlanner#UI_OPS}
+         */
         public boolean isUiOperation() {
             String op = operation == null ? "" : operation.toLowerCase();
             return UI_OPS.contains(op);
         }
 
+        /**
+         * Истина, если операция относится к API-исполнителю.
+         *
+         * @return {@code true}, если операция входит в {@link StepPlanner#API_OPS}
+         */
         public boolean isApiOperation() {
             String op = operation == null ? "" : operation.toLowerCase();
             return API_OPS.contains(op);
         }
 
+        /**
+         * Проверяет, что операция допустима для типа кейса.
+         * <p>
+         * Для {@code UI} допустимы только {@link StepPlanner#UI_OPS}, для {@code API} только
+         * {@link StepPlanner#API_OPS}. Для {@code E2E}, {@code NEGATIVE} и {@code SECURITY}
+         * допустима любая из двух групп. Планы {@code skip} и {@code needClarification}
+         * проверки не проходят. Неизвестный тип только логируется, проверка пропускается.
+         *
+         * @param caseType тип кейса; может быть {@code null}
+         * @return этот же план
+         * @throws GenerationException операция не входит в допустимый набор для типа
+         */
         public Plan validateAgainst(String caseType) {
             if (isSkip() || needsClarification()) return this;
             String op = operation == null ? "" : operation.toLowerCase();
@@ -104,6 +200,15 @@ public class StepPlanner {
             return this;
         }
 
+        /**
+         * Возвращает цели элементов плана.
+         * <p>
+         * Если задан непустой список {@code elements}, возвращается он. Иначе, если задан
+         * {@code locator}, создаётся одна цель с альтернативами из {@code locatorAlternatives}.
+         * В остальных случаях список пуст.
+         *
+         * @return неизменяемый или непустой список целей; никогда не {@code null}
+         */
         public List<ElementTarget> effectiveElements() {
             if (elements != null && !elements.isEmpty()) return elements;
             if (locator != null && !locator.isBlank()) {
@@ -115,6 +220,18 @@ public class StepPlanner {
         }
     }
 
+    /**
+     * Разбирает список альтернативных локаторов из строки.
+     * <p>
+     * Строка, начинающаяся с {@code [}, разбирается как JSON-массив, и каждый элемент
+     * приводится к тексту. Если разбор не удался или это не массив, строка делится по
+     * запятым. Пустые части отбрасываются, остальные обрезаются. Запятые внутри локатора
+     * (например, в CSS-псевдоклассе) разбивают его на части. Значения {@code null} и
+     * {@code "null"} дают пустой список.
+     *
+     * @param alts строка альтернатив; может быть {@code null}
+     * @return изменяемый список альтернатив, возможно пустой
+     */
     private static List<String> splitAlternativesInternal(String alts) {
         if (alts == null || alts.isBlank() || "null".equalsIgnoreCase(alts)) return List.of();
         String s = alts.trim();
@@ -136,17 +253,34 @@ public class StepPlanner {
     }
 
     /**
-     * FIX (массив планов): модель может вернуть как одиночный объект {@code {...}},
-     * так и массив {@code [{...}, {...}]}.
+     * Строит промпт для текущего шага, запрашивает план у модели и возвращает его.
      * <p>
-     * FIX (сравнение между шагами): параметр {@code snapshots} передаёт модели
-     * уже снятые значения, чтобы она не пыталась снять заново и могла ссылаться
-     * на них в assert*EqualsSnapshot.
+     * Промпт включает тип кейса, все шаги с отметкой текущего, последующие шаги (чтобы
+     * модель могла сразу снять снимок для будущего сравнения), ответы пользователя,
+     * выполненные шаги, снимки, DOM-снимок страницы, базовый URL API, статус, заголовки и
+     * тело последнего ответа. Если базовый URL API не задан, модель получает инструкцию
+     * вернуть {@code needClarification} для {@code api_base_url}.
      * <p>
-     * FIX (будущие шаги): в промпт добавлен список последующих шагов кейса —
-     * это нужно, чтобы ПРАВИЛО 8.1 (snapshot СРАЗУ при выполнении эталона)
-     * реально работало: модель видит «Шаг #3: Сравнить …» и понимает,
-     * что на текущем шаге надо снять snapshot.
+     * Ограничения по размеру: DOM обрезается до 40000 символов, тело последнего ответа
+     * до 12000, описание каждого выполненного шага до 500, превью снимка до 200. Лимит
+     * {@code app.planner.max-input-chars} в этом методе не проверяется.
+     * <p>
+     * Ответ модели очищается от обёртки {@code ```json} и разбирается через
+     * {@link #parsePlans}.
+     *
+     * @param tc                    тест-кейс
+     * @param stepIndex             индекс текущего шага, с 0
+     * @param stepText              текст текущего шага
+     * @param domSnapshot           текстовый снимок DOM страницы; может быть {@code null}
+     * @param apiBaseUrl            базовый URL API; может быть {@code null}
+     * @param previousEnrichments   записи выполненных шагов кейса; может быть {@code null}
+     * @param lastResponseBody      тело последнего ответа API; может быть {@code null}
+     * @param lastResponseHeaders   заголовки последнего ответа API; может быть {@code null}
+     * @param lastStatusCode        статус последнего ответа API; может быть {@code null}
+     * @param snapshots             снимки значений по ключам; может быть {@code null}
+     * @return список планов (один или несколько) для текущего шага
+     * @throws GenerationException ошибка LLM, невалидный JSON, пустой массив или план,
+     *                             не соответствующий типу кейса
      */
     public List<Plan> planStep(ParsedTestCase tc, int stepIndex, String stepText, String domSnapshot,
                                String apiBaseUrl, List<StepEnrichment> previousEnrichments,
@@ -254,6 +388,14 @@ public class StepPlanner {
         return parsePlans(cleaned, tc.type());
     }
 
+    /**
+     * Разбирает JSON-ответ модели как один план или массив планов и проверяет каждый план.
+     *
+     * @param cleaned  очищенный текст ответа модели
+     * @param caseType тип кейса для проверки операций
+     * @return список планов, не пустой
+     * @throws GenerationException ответ не является валидным JSON, массив пуст или план не проходит проверку
+     */
     private List<Plan> parsePlans(String cleaned, String caseType) {
         try {
             JsonNode root = mapper.readTree(cleaned);
@@ -277,6 +419,19 @@ public class StepPlanner {
         }
     }
 
+    /**
+     * Преобразует JSON-объект в {@link Plan}.
+     * <p>
+     * Строковые поля берутся через {@link #str}, которое вызывает {@code toString()} у
+     * значения. Поля, переданные моделью не строкой (например, вложенный объект в
+     * {@code bodyJson}), попадают в план как Java-представление, а не как JSON.
+     * {@code elements} разбирается через {@link #parseElements}, {@code expectedStatus}
+     * через {@link #parseExpectedStatus}.
+     *
+     * @param node JSON-узел плана
+     * @return план без проверки типа кейса
+     * @throws GenerationException узел не является объектом или неверный {@code expectedStatus}
+     */
     private Plan toPlan(JsonNode node) {
         if (node == null || !node.isObject()) {
             throw new GenerationException(
@@ -299,6 +454,16 @@ public class StepPlanner {
         );
     }
 
+    /**
+     * Извлекает цели элементов из поля {@code elements} плана.
+     * <p>
+     * Записи, которые не являются объектом или у которых пустой {@code locator}, пропускаются.
+     * Поле {@code alternatives} может быть массивом или строкой с запятыми, которую разбирает
+     * {@link #splitAlternativesInternal}.
+     *
+     * @param raw значение поля {@code elements}; может быть {@code null}
+     * @return список целей, возможно пустой
+     */
     private List<ElementTarget> parseElements(Object raw) {
         if (raw == null) return List.of();
         if (!(raw instanceof List<?> list)) return List.of();
@@ -325,6 +490,16 @@ public class StepPlanner {
         return out;
     }
 
+    /**
+     * Приводит ожидаемый HTTP-статус к числу.
+     * <p>
+     * Принимается число любого типа, которое приводится через {@code intValue()}, либо строка
+     * ровно из трёх цифр. {@code null} означает, что статус не проверяется.
+     *
+     * @param raw значение из JSON; может быть {@code null}
+     * @return код статуса или {@code null}
+     * @throws GenerationException значение не число и не строка из трёх цифр
+     */
     private static Integer parseExpectedStatus(Object raw) {
         if (raw == null) return null;
         if (raw instanceof Number n) return n.intValue();
@@ -332,10 +507,23 @@ public class StepPlanner {
         throw new GenerationException("expectedStatus должен быть числом из 3 цифр, получено: " + raw);
     }
 
+    /**
+     * Приводит значение к строке через {@code toString()}.
+     *
+     * @param o значение; может быть {@code null}
+     * @return строка либо {@code null}
+     */
     private static String str(Object o) {
         return o == null ? null : o.toString();
     }
 
+    /**
+     * Обрезает строку до {@code max} символов и добавляет «…», если она длиннее.
+     *
+     * @param s   исходная строка; может быть {@code null}
+     * @param max максимальная длина без многоточия
+     * @return обрезанная строка либо пустая строка для {@code null}
+     */
     private static String truncate(String s, int max) {
         if (s == null) return "";
         return s.length() <= max ? s : s.substring(0, max) + "…";

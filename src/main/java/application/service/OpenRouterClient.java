@@ -12,18 +12,57 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * HTTP-клиент OpenRouter для запросов к LLM, которые строят план шага.
+ * <p>
+ * Место в конвейере: {@link StepPlanner} формирует системный и пользовательский промпты
+ * и получает ответ модели через {@link #complete}. Клиент выполняет один запрос
+ * к {@code /chat/completions} с {@code response_format=json_object} и извлекает текст
+ * ответа. Все ошибки транспорта и пустые ответы превращаются в {@link GenerationException}.
+ */
 @Slf4j
 @Service
 public class OpenRouterClient {
 
+    /**
+     * Настройки OpenRouter: модель и лимит выходных токенов.
+     */
     private final OpenRouterProperties props;
+
+    /**
+     * REST-клиент, настроенный на базовый URL OpenRouter.
+     */
     private final RestClient http;
 
+    /**
+     * Создаёт клиент.
+     *
+     * @param props                настройки OpenRouter
+     * @param openRouterRestClient предварительно настроенный REST-клиент
+     */
     public OpenRouterClient(OpenRouterProperties props, RestClient openRouterRestClient) {
         this.props = props;
         this.http = openRouterRestClient;
     }
 
+    /**
+     * Отправляет запрос к модели и возвращает текст ответа.
+     * <p>
+     * Запрос фиксирует недетерминизм модели: {@code temperature=0}, {@code top_p=1}
+     * (жадное декодирование) и {@code seed=42}. Провайдеры, которые поддерживают seed,
+     * дают воспроизводимые ответы. Режим рассуждений задан как {@code effort=high}.
+     * <p>
+     * Текст ответа берётся из {@code choices[0].message.content}. Если он пуст, используются
+     * по порядку {@code reasoning_content} и аргументы первого {@code tool_calls}.
+     * Если и они пусты, запрос считается неудачным. Ошибки HTTP логируются с обрезанным
+     * телом ответа.
+     *
+     * @param systemPrompt системный промпт
+     * @param userText     пользовательский текст
+     * @return непустой текст ответа модели
+     * @throws GenerationException HTTP-ошибка, отсутствие или пустота {@code choices}/{@code message}/content,
+     *                             либо любая иная ошибка клиента
+     */
     @SuppressWarnings("unchecked")
     public String complete(String systemPrompt, String userText) {
         Map<String, Object> body = new HashMap<>();
@@ -36,10 +75,6 @@ public class OpenRouterClient {
         body.put("response_format", Map.of("type", "json_object"));
         body.put("reasoning", Map.of("effort", "high"));
 
-        // Стабилизация недетерминизма LLM:
-        // - temperature=0 + top_p=1 → жадное декодирование
-        // - seed=42 → фиксированный seed (провайдеры, поддерживающие его, дают
-        //   воспроизводимые ответы)
         body.put("temperature", 0);
         body.put("top_p", 1);
         body.put("seed", 42);
@@ -109,6 +144,13 @@ public class OpenRouterClient {
         }
     }
 
+    /**
+     * Обрезает строку до {@code max} символов и добавляет «…», если она длиннее.
+     *
+     * @param s   исходная строка; может быть {@code null}
+     * @param max максимальная длина без многоточия
+     * @return обрезанная строка либо пустая строка для {@code null}
+     */
     private static String truncate(String s, int max) {
         if (s == null) return "";
         return s.length() <= max ? s : s.substring(0, max) + "…";

@@ -3,6 +3,7 @@ package application.service;
 import application.config.AppProperties;
 import application.dto.Dtos.StepEnrichment;
 import application.exception.AssertionFailure;
+import application.exception.TargetNotAllowedException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.restassured.RestAssured;
@@ -18,26 +19,122 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * Исполнитель API-шагов тест-кейса на базе RestAssured.
+ * <p>
+ * Место в конвейере: {@link HybridCaseRunner} передаёт сюда шаги, которые
+ * {@link StepPlanner} пометил как API-операции. Поддерживаются HTTP-вызов
+ * {@code apiCall}, проверки тела ({@code assertBody}, {@code assertBodyAbsent}),
+ * заголовков ({@code assertHeader}, {@code assertHeaderAbsent}), статуса
+ * ({@code assertStatus}), разбор JSON ({@code parseJson}), а также снимок и
+ * сравнение JSON-значения между шагами ({@code snapshotApiValue},
+ * {@code assertApiValueEqualsSnapshot}).
+ * <p>
+ * Каждый шаг возвращает {@link ApiStepResult}: в нём enrichment для отчёта и
+ * состояние последнего ответа, которое следующий шаг получает как входные данные.
+ * Провал проверки или сетевой сбой — {@link AssertionFailure}; некорректный или
+ * неполный план — {@link UiExecutor.LocatorNotResolved}; хост вне allowlist —
+ * {@link TargetNotAllowedException}.
+ * <p>
+ * Все HTTP-вызовы проходят проверку {@link TargetUrlGuard}.
+ */
 @Slf4j
 @Service
 public class ApiExecutor {
 
+    /**
+     * Маппер для разбора и форматирования JSON тел запросов и ответов.
+     */
     private final ObjectMapper mapper = new ObjectMapper();
+
+    /**
+     * Настройки приложения; из них берётся лимит длины тела в enrichment.
+     */
     private final AppProperties appProps;
 
-    public ApiExecutor(AppProperties appProps) {
+    /**
+     * Проверка allowlist-а хостов перед каждым HTTP-вызовом.
+     */
+    private final TargetUrlGuard targetUrlGuard;
+
+    /**
+     * Создаёт исполнитель API-шагов.
+     *
+     * @param appProps       настройки приложения
+     * @param targetUrlGuard защита от SSRF, применяется к каждому apiCall
+     */
+    public ApiExecutor(AppProperties appProps, TargetUrlGuard targetUrlGuard) {
         this.appProps = appProps;
+        this.targetUrlGuard = targetUrlGuard;
     }
 
+    /**
+     * Результат выполнения одного API-шага.
+     *
+     * @param enrichment         запись для отчёта; тело ответа в ней обрезается
+     *                           по {@code app.enrichment-body-limit}
+     * @param responseBody       тело последнего ответа, которое увидит следующий шаг
+     * @param responseHeaders    заголовки последнего ответа; {@code null}, если шаг
+     *                           их не возвращает (см. {@link #assertApiValueEqualsSnapshot})
+     * @param responseStatusCode статус последнего ответа; {@code null}, если шаг
+     *                           его не возвращает
+     */
     public record ApiStepResult(StepEnrichment enrichment,
                                 String responseBody,
                                 Map<String, String> responseHeaders,
                                 Integer responseStatusCode) {
     }
 
+    /**
+     * Результат операции {@code snapshotApiValue}.
+     *
+     * @param enrichment запись для отчёта
+     * @param key        имя слота снимка, из {@code plan.snapshotKey()}
+     * @param value      каноническая JSON-строка выбранного значения
+     */
     public record SnapshotResult(StepEnrichment enrichment, String key, String value) {
     }
 
+    /**
+     * Выполняет API-шаг, который не является снимком или сравнением снимков.
+     * <p>
+     * Операция {@code plan.operation()} сравнивается без учёта регистра. Любая
+     * неизвестная операция, включая пустую, трактуется как {@code apiCall}.
+     * Операции {@code snapshotApiValue} и {@code assertApiValueEqualsSnapshot}
+     * здесь не поддерживаются: вызывающий код обязан направлять их в
+     * соответствующие методы, иначе выбрасывается {@link IllegalStateException}.
+     * <p>
+     * Для {@code apiCall} полный URL строится из {@code apiBaseUrl} и
+     * {@code plan.path()} (см. {@link #buildFullUrl}), затем проверяется
+     * {@link TargetUrlGuard}. Хост вне allowlist даёт {@link TargetNotAllowedException}
+     * (провал шага, а не запрос уточнения). Редиректы не отслеживаются
+     * ({@code follow(false)}), чтобы 3xx на внутренний адрес не обходил проверку
+     * allowlist. Заголовки собираются так: сначала {@code headers} кейса, затем
+     * заголовки плана, которые перекрывают одноимённые. Тело отправляется только
+     * если оно непустое и не равно {@code "{}"}; при отсутствии Content-Type
+     * ставится {@code application/json}.
+     * <p>
+     * Идемпотентные методы GET, HEAD и OPTIONS выполняются до 3 раз при ответе
+     * 5xx или сетевом {@link IOException}, с паузой {@code 500 мс × номер попытки}.
+     * Остальные методы выполняются один раз. Если ожидаемый статус задан в плане
+     * и не совпал, шаг завершается провалом.
+     *
+     * @param stepIndex           индекс шага, начиная с 0 (в логах выводится +1)
+     * @param plan                план шага от LLM
+     * @param apiBaseUrl          базовый URL API; нужен для относительного пути
+     * @param headers             заголовки, общие для кейса; может быть {@code null}
+     * @param pathParams          параметры подстановки в путь RestAssured; может быть {@code null}
+     * @param lastResponseBody    тело предыдущего ответа; может быть {@code null}
+     * @param lastResponseHeaders заголовки предыдущего ответа; может быть {@code null}
+     * @param lastStatusCode      статус предыдущего ответа; может быть {@code null}
+     * @return результат шага с enrichment и состоянием последнего ответа
+     * @throws AssertionFailure              проверка не прошла, либо вызов API завершился ошибкой
+     *                                       или не получил ответа
+     * @throws TargetNotAllowedException     хост URL не входит в {@code app.target.allowed-hosts}
+     * @throws UiExecutor.LocatorNotResolved план неполон или некорректен (нет значения,
+     *                                       URL, метода), нужно уточнение
+     * @throws IllegalStateException         переданы операции снимков
+     */
     public ApiStepResult executeStep(int stepIndex,
                                      StepPlanner.Plan plan,
                                      String apiBaseUrl,
@@ -49,13 +146,11 @@ public class ApiExecutor {
 
         String op = plan.operation() == null ? "" : plan.operation().toLowerCase();
 
-        // ---- snapshotApiValue ----
         if ("snapshotapivalue".equals(op)) {
             throw new IllegalStateException(
                     "snapshotApiValue обрабатывается отдельным методом snapshotApiValue(...)");
         }
 
-        // ---- assertApiValueEqualsSnapshot ----
         if ("assertapivalueequalssnapshot".equals(op)) {
             throw new IllegalStateException(
                     "assertApiValueEqualsSnapshot обрабатывается отдельным методом");
@@ -242,7 +337,6 @@ public class ApiExecutor {
             }
         }
 
-        // ---- apiCall ----
         String method = plan.method() == null ? "" : plan.method().trim().toUpperCase();
         if (method.isEmpty()) method = "GET";
         String path = plan.path();
@@ -264,6 +358,11 @@ public class ApiExecutor {
                             + fullUrl + "`. Проверьте apiBaseUrl в RunRequest или path в плане.");
         }
 
+        if (!targetUrlGuard.isAllowed(fullUrl)) {
+            throw new TargetNotAllowedException("Хост не разрешён для API: " + host
+                    + ". Добавьте его в app.target.allowed-hosts");
+        }
+
         String baseUri = scheme + "://" + host
                 + (uri.getPort() > 0 ? ":" + uri.getPort() : "");
         String uriPath = uri.getRawPath();
@@ -282,6 +381,7 @@ public class ApiExecutor {
         }
 
         RequestSpecification req = RestAssured.given().baseUri(baseUri).relaxedHTTPSValidation();
+        req.redirects().follow(false);
         effectiveHeaders.forEach(req::header);
         if (pathParams != null && !pathParams.isEmpty()) req.pathParams(pathParams);
         if (hasBody) req.body(bodyJson);
@@ -352,9 +452,19 @@ public class ApiExecutor {
     }
 
     /**
-     * Снимок JSON-значения по JSONPath/JSON Pointer {@code plan.jsonPath()}
-     * в named-слот {@code plan.snapshotKey()}.
-     * Требует тело предыдущего ответа ({@code lastResponseBody}).
+     * Снимает JSON-значение из тела предыдущего ответа в именованный слот снимка.
+     * <p>
+     * Путь {@code plan.jsonPath()} приводится к JSON Pointer через
+     * {@link #toJsonPointer(String)}. Значение сохраняется в компактной
+     * канонической форме (см. {@link #canonicalize(JsonNode)}), чтобы
+     * последующее сравнение было побайтовым. Тело ответа не изменяется.
+     *
+     * @param stepIndex          индекс шага, начиная с 0
+     * @param plan               план шага; нужны {@code snapshotKey} и {@code jsonPath}
+     * @param lastResponseBody   тело предыдущего ответа
+     * @return результат со слотом снимка и каноническим значением
+     * @throws AssertionFailure              тело отсутствует, не является JSON или путь не найден
+     * @throws UiExecutor.LocatorNotResolved не указаны ключ снимка или путь
      */
     public SnapshotResult snapshotApiValue(int stepIndex, StepPlanner.Plan plan,
                                            String lastResponseBody) {
@@ -394,8 +504,26 @@ public class ApiExecutor {
     }
 
     /**
-     * Сравнивает текущий JSON-срез ({@code plan.jsonPath()}) со снимком
-     * {@code plan.snapshotKey()} из {@code snapshots}.
+     * Сравнивает JSON-значение из тела текущего ответа со снимком того же ключа.
+     * <p>
+     * Текущий срез по {@code plan.jsonPath()} канонизируется и сравнивается с
+     * {@code snapshots.get(plan.snapshotKey())} строгим равенством строк. При
+     * расхождении в исключении отчёта не остаётся: первое различие
+     * ({@link #firstDifference}) попадает только в локальное описание, которое
+     * не возвращается вызывающему коду.
+     * <p>
+     * Возвращаемый результат содержит {@code null} вместо заголовков и статуса,
+     * сохраняя тело. {@link HybridCaseRunner} эти поля не использует для данной
+     * операции и оставляет предыдущее состояние без изменений, поэтому последующие
+     * {@code assertHeader} и {@code assertStatus} продолжают работать с ответом apiCall.
+     *
+     * @param stepIndex        индекс шага, начиная с 0
+     * @param plan             план шага; нужны {@code snapshotKey} и {@code jsonPath}
+     * @param lastResponseBody тело текущего ответа
+     * @param snapshots        набор снимков кейса по ключам; может быть {@code null}
+     * @return результат проверки с enrichment и телом ответа
+     * @throws AssertionFailure              снимка нет, тело не JSON, путь не найден или значения различаются
+     * @throws UiExecutor.LocatorNotResolved не указаны ключ снимка или путь
      */
     public ApiStepResult assertApiValueEqualsSnapshot(int stepIndex, StepPlanner.Plan plan,
                                                       String lastResponseBody,
@@ -451,12 +579,17 @@ public class ApiExecutor {
                 lastResponseBody, null, null);
     }
 
-    // ---- helpers ----
-
     /**
-     * Приводит путь к формату RFC 6901 (JSON Pointer).
-     * Принимает: "/hourly/temperature_2m", "$.hourly.temperature_2m", "$", "".
-     * Возвращает: "/hourly/temperature_2m", "/", "/".
+     * Приводит путь к JSON Pointer (RFC 6901).
+     * <p>
+     * Принимает JSON Pointer как есть ({@code /hourly/temperature_2m}) и путь
+     * в стиле JSONPath с корнем {@code $} ({@code $.hourly.temperature_2m}).
+     * Точки в JSONPath заменяются на «/», поэтому ключи, содержащие точку,
+     * и индексы вида {@code [0]} не адресуются. Экранирование {@code ~0} и
+     * {@code ~1} не выполняется. Пустой путь и {@code $} дают {@code "/"}.
+     *
+     * @param raw путь из плана; может быть {@code null}
+     * @return JSON Pointer, начинающийся с {@code /}
      */
     private static String toJsonPointer(String raw) {
         if (raw == null || raw.isBlank()) return "/";
@@ -473,11 +606,31 @@ public class ApiExecutor {
         return s;
     }
 
+    /**
+     * Сериализует JSON-узел в компактную строку, которая используется как снимок.
+     * Порядок полей сохраняется так, как он пришёл в ответе. Отсутствующий узел
+     * ({@code null}) даёт строку {@code "null"}.
+     *
+     * @param node узел JSON; может быть {@code null}
+     * @return компактная JSON-строка
+     */
     private static String canonicalize(JsonNode node) {
         if (node == null) return "null";
         return node.toString();
     }
 
+    /**
+     * Находит позицию первого расхождения двух строк и возвращает фрагменты вокруг неё.
+     * <p>
+     * Окно вокруг позиции расхождения составляет примерно {@code radius} символов:
+     * {@code radius / 2} до и после позиции. Если одна строка является префиксом
+     * другой, позиция равна длине более короткой строки.
+     *
+     * @param a      первая строка (эталон)
+     * @param b      вторая строка (текущее значение)
+     * @param radius полный размер окна для вывода
+     * @return многострочное описание: эталон, факт и смещение
+     */
     private static String firstDifference(String a, String b, int radius) {
         int i = 0, n = Math.min(a.length(), b.length());
         while (i < n && a.charAt(i) == b.charAt(i)) i++;
@@ -489,6 +642,13 @@ public class ApiExecutor {
                 + "offset:   " + i;
     }
 
+    /**
+     * Проверяет и нормализует ключ снимка: непустой ключ возвращается обрезанным.
+     *
+     * @param k ключ из плана; может быть {@code null}
+     * @return ключ без пробелов по краям
+     * @throws UiExecutor.LocatorNotResolved ключ отсутствует или пуст
+     */
     private static String requireSnapshotKey(String k) {
         if (k == null || k.isBlank()) {
             throw new UiExecutor.LocatorNotResolved(
@@ -497,6 +657,16 @@ public class ApiExecutor {
         return k.trim();
     }
 
+    /**
+     * Разбирает заголовки плана, заданные по одной паре {@code Name: value} в строке.
+     * <p>
+     * Строки разделяются любым переводом строки. Разбиение идёт по первому двоеточию;
+     * строки без двоеточия или с двоеточием в начале пропускаются. Имя и значение
+     * обрезаются. Повторяющееся имя перезаписывает значение, но сохраняет позицию.
+     *
+     * @param raw текст заголовков; может быть {@code null} или пустым
+     * @return изменяемая карта заголовков в порядке первого появления; никогда не {@code null}
+     */
     private Map<String, String> parseHeaders(String raw) {
         Map<String, String> out = new LinkedHashMap<>();
         if (raw == null || raw.isBlank()) return out;
@@ -510,6 +680,17 @@ public class ApiExecutor {
         return out;
     }
 
+    /**
+     * Формирует curl-команду, которой можно воспроизвести запрос (только для отчёта).
+     * Одинарные кавычки в значениях экранируются конструкцией {@code '\''}.
+     * Тело добавляется, только если оно непустое и не равно {@code "{}"}.
+     *
+     * @param method  HTTP-метод
+     * @param url     полный URL запроса
+     * @param headers заголовки запроса; может быть {@code null}
+     * @param body    тело запроса или {@code null}
+     * @return многострочная команда, строки которой разделены обратным слешем и переводом строки
+     */
     private String buildCurl(String method, String url, Map<String, String> headers, String body) {
         StringBuilder sb = new StringBuilder("curl -X ").append(method).append(" '").append(url).append("'");
         if (headers != null) {
@@ -524,6 +705,21 @@ public class ApiExecutor {
         return sb.toString();
     }
 
+    /**
+     * Собирает многострочный отчёт по выполненному {@code apiCall}: запрос,
+     * заголовки ответа и тело ответа. Тело запроса и тело ответа выводятся
+     * в JSON-формате с отступами, если это возможно (см. {@link #beautifyJsonIfPossible}).
+     * Пустое тело ответа в отчёт не включается.
+     *
+     * @param method          HTTP-метод
+     * @param fullUrl         полный URL запроса
+     * @param status          HTTP-статус ответа
+     * @param reqHeaders      заголовки запроса; могут быть {@code null}
+     * @param reqBody         тело запроса или {@code null}
+     * @param responseHeaders заголовки ответа; могут быть {@code null}
+     * @param body            тело ответа; может быть {@code null} или пустым
+     * @return текст отчёта
+     */
     private String buildApiCallDetail(String method, String fullUrl, int status,
                                       Map<String, String> reqHeaders, String reqBody,
                                       Map<String, String> responseHeaders, String body) {
@@ -562,6 +758,12 @@ public class ApiExecutor {
         return sb.toString();
     }
 
+    /**
+     * Форматирует строку как JSON с отступами; если строка не является JSON, возвращает её без изменений.
+     *
+     * @param body исходная строка; может быть {@code null}
+     * @return отформатированный JSON либо исходная строка
+     */
     private String beautifyJsonIfPossible(String body) {
         try {
             var node = mapper.readTree(body);
@@ -572,6 +774,17 @@ public class ApiExecutor {
         }
     }
 
+    /**
+     * Обрезает тело ответа для enrichment согласно {@code app.enrichment-body-limit}.
+     * <p>
+     * Лимит {@code 0} или отрицательный отключает обрезку. Обрезка применяется
+     * только к отчёту: тело, которое получают следующие шаги, остаётся полным. Планировщик
+     * может обрезать тело в своём промпте независимо от этого лимита (см. {@link StepPlanner#planStep}).
+     *
+     * @param body тело ответа; может быть {@code null}
+     * @return исходное тело, если оно не превышает лимит, иначе усечённая строка с пометкой;
+     *         {@code null}, если тело {@code null}
+     */
     private String truncateSample(String body) {
         if (body == null) return null;
         int limit = appProps.getEnrichmentBodyLimit();
@@ -579,11 +792,29 @@ public class ApiExecutor {
         return body.substring(0, limit) + "\n… (truncated at " + limit + " chars)";
     }
 
+    /**
+     * Обрезает строку до {@code max} символов и добавляет «…», если она длиннее.
+     *
+     * @param s   исходная строка; может быть {@code null}
+     * @param max максимальная длина без многоточия
+     * @return обрезанная строка, пустая строка для {@code null}
+     */
     private static String truncate(String s, int max) {
         if (s == null) return "";
         return s.length() <= max ? s : s.substring(0, max) + "…";
     }
 
+    /**
+     * Возвращает фрагмент тела вокруг найденного совпадения для отчёта.
+     * Вокруг совпадения берётся {@code radius} символов с каждой стороны. Если фрагмент
+     * не доходит до края тела, с этой стороны ставится «…».
+     *
+     * @param body       полный текст
+     * @param matchStart позиция начала совпадения
+     * @param matchLen   длина совпадения
+     * @param radius     количество символов контекста с каждой стороны
+     * @return фрагмент с многоточиями по обрезанным краям
+     */
     private String contextAround(String body, int matchStart, int matchLen, int radius) {
         int from = Math.max(0, matchStart - radius);
         int to = Math.min(body.length(), matchStart + matchLen + radius);
@@ -592,6 +823,13 @@ public class ApiExecutor {
         return prefix + body.substring(from, to) + suffix;
     }
 
+    /**
+     * Ищет значение заголовка по имени без учёта регистра.
+     *
+     * @param headers карта заголовков; может быть {@code null}
+     * @param name    имя заголовка
+     * @return значение первого совпавшего заголовка или {@code null}, если такого нет
+     */
     private String findHeaderIgnoreCase(Map<String, String> headers, String name) {
         if (headers == null) return null;
         for (Map.Entry<String, String> e : headers.entrySet()) {
@@ -602,6 +840,20 @@ public class ApiExecutor {
         return null;
     }
 
+    /**
+     * Строит полный URL вызова API.
+     * <p>
+     * Абсолютный путь ({@code http://} или {@code https://}) используется как есть.
+     * Относительный путь присоединяется к {@code apiBaseUrl}: завершающий «/» базы
+     * убирается, а отсутствующий «/» пути добавляется. {@code null}-путь даёт
+     * только базу. Для относительного пути {@code apiBaseUrl} обязан начинаться с
+     * {@code http://} или {@code https://} (проверка регистрозависимая).
+     *
+     * @param apiBaseUrl базовый URL API; может быть {@code null}
+     * @param path       путь или абсолютный URL из плана; может быть {@code null}
+     * @return полный URL
+     * @throws UiExecutor.LocatorNotResolved путь относительный, а {@code apiBaseUrl} не задан или некорректен
+     */
     private String buildFullUrl(String apiBaseUrl, String path) {
         if (path != null && (path.startsWith("http://") || path.startsWith("https://"))) {
             return path;
@@ -620,6 +872,13 @@ public class ApiExecutor {
         return base + p;
     }
 
+    /**
+     * Приостанавливает поток на заданное время. Если поток прерван, флаг прерывания
+     * восстанавливается, а исключение не пробрасывается: вызывающий код продолжает
+     * следующую попытку.
+     *
+     * @param ms длительность паузы в миллисекундах
+     */
     private static void sleepQuietly(long ms) {
         try {
             Thread.sleep(ms);

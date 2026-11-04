@@ -6,6 +6,7 @@ import application.dto.Dtos.ParsedTestCase;
 import application.dto.Dtos.StepEnrichment;
 import application.exception.AssertionFailure;
 import application.exception.GenerationException;
+import application.exception.TargetNotAllowedException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -14,29 +15,71 @@ import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+/**
+ * Оркестратор выполнения одного тест-кейса.
+ * <p>
+ * Место в конвейере: {@link TestCaseRunnerService} вызывает {@link #run} для каждого
+ * кейса. Для каждого шага оркестратор запрашивает план у {@link StepPlanner},
+ * направляет план в {@link UiExecutor} или {@link ApiExecutor}, хранит состояние кейса
+ * (тело и заголовки последнего ответа, статус, снимки, браузерную сессию) и собирает
+ * итоговый {@link ExecutionOutcome}.
+ * <p>
+ * Статусы итога:
+ * <ul>
+ *   <li>{@code NEEDS_CLARIFICATION}: шаг требует ответа пользователя; выполнение
+ *       прерывается сразу, провалы, накопленные до этого, в статус не попадают;</li>
+ *   <li>{@code FAILED}: есть хотя бы один провал, но кейс прошёл до конца;</li>
+ *   <li>{@code SKIPPED}: все записи отчёта являются пропусками по ответам пользователя;</li>
+ *   <li>{@code PASSED}: иначе.</li>
+ * </ul>
+ * Тип кейса определяет допустимые операции: {@code API} не допускает UI-операции,
+ * {@code UI} не допускает API-операции, для остальных типов допустимы обе группы.
+ */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class HybridCaseRunner {
 
+    /**
+     * Планировщик, который по тексту шага строит список планов через LLM.
+     */
     private final StepPlanner planner;
+
+    /**
+     * Исполнитель UI-операций на базе Playwright.
+     */
     private final UiExecutor uiExecutor;
+
+    /**
+     * Исполнитель API-операций на базе RestAssured.
+     */
     private final ApiExecutor apiExecutor;
 
     /**
-     * Признаки «этот шаг требует сравнения с предыдущим».
+     * Признаки того, что шаг сравнивает результат с предыдущим (сравнить, идентичны,
+     * совпадают, оба ответа, не изменился, равны). Используется препроцессором,
+     * который добавляет snapshotApiValue для будущего сравнения.
      */
     private static final Pattern COMPARE_HINT = Pattern.compile(
             "сравн|идентичн|совпад|оба ответ|не измен|равн",
             Pattern.CASE_INSENSITIVE);
 
     /**
-     * Извлечение пути вида hourly.temperature_2m из текста шага.
+     * Ищет в тексте шага первый идентификатор с точкой вида {@code hourly.temperature_2m}.
+     * Найденная строка становится кандидатом на jsonPath снимка.
      */
     private static final Pattern JSON_PATH_HINT = Pattern.compile(
             "([a-z_][a-z0-9_]*(?:\\.[a-z_][a-z0-9_]*)+)",
             Pattern.CASE_INSENSITIVE);
 
+    /**
+     * Итог выполнения кейса.
+     *
+     * @param outcome             итоговая запись кейса для отчёта
+     * @param clarifications      вопросы пользователю; пусто, если уточнения не требуются
+     * @param stoppedAtStepIndex  индекс шага (с 0), на котором прервано выполнение;
+     *                            при полном проходе равен числу шагов кейса
+     */
     public record Result(
             ExecutionOutcome outcome,
             List<Clarification> clarifications,
@@ -44,14 +87,76 @@ public class HybridCaseRunner {
     ) {
     }
 
+    /**
+     * Результат API-операции, который передаётся в цикл шагов.
+     *
+     * @param enrichment запись для отчёта
+     * @param apiResult  результат apiCall-подобного шага, из которого обновляется состояние
+     *                   последнего ответа; {@code null} для операций снимков, которые
+     *                   состояние не меняют
+     */
     private record ApiOpResult(StepEnrichment enrichment,
                                ApiExecutor.ApiStepResult apiResult) {
     }
 
+    /**
+     * Выполняет тест-кейс с первого шага. Делегирует в {@link #run(ParsedTestCase, String, String, int)}
+     * с {@code startStep = 0}.
+     *
+     * @param tc         разобранный тест-кейс
+     * @param startUrl   стартовый URL для UI-шагов; может быть {@code null}
+     * @param apiBaseUrl базовый URL API; может быть {@code null}
+     * @return итог выполнения кейса
+     */
     public Result run(ParsedTestCase tc, String startUrl, String apiBaseUrl) {
         return run(tc, startUrl, apiBaseUrl, 0);
     }
 
+    /**
+     * Выполняет тест-кейс, начиная с указанного шага.
+     * <p>
+     * Состояние предыдущих шагов не восстанавливается: при {@code startStep > 0}
+     * тело и заголовки последнего ответа, статус, снимки и браузерная сессия пусты, так
+     * что шаги, которые на них опираются, дадут пропуск или запрос уточнения.
+     * <p>
+     * Шаг обрабатывается так:
+     * <ol>
+     *   <li>План строится через {@link StepPlanner#planStep}. Если LLM не справилась
+     *       ({@link GenerationException}), в отчёт пишется ошибка планирования, шаг
+     *       считается проваленным, выполнение продолжается.</li>
+     *   <li>Если кейс не UI и текущий шаг содержит apiCall, а в будущих шагах есть
+     *       признак сравнения, препроцессор добавляет snapshotApiValue
+     *       (см. {@link #maybeAddSnapshotForFutureCompare}).</li>
+     *   <li>План с признаком пропуска записывается как {@code skip}. Пропуск apiCall
+     *       сбрасывает признак доступных API-данных.</li>
+     *   <li>План, требующий уточнения, пропускается, если на его тему уже есть ответ
+     *       или {@code SKIP}. Иначе выполнение прерывается с {@code NEEDS_CLARIFICATION}.</li>
+     *   <li>Операция вне допустимых для типа кейса групп даёт провал
+     *       ({@code type-mismatch}). API-проверка без успешного предыдущего apiCall
+     *       пропускается как каскадная.</li>
+     *   <li>UI-операции выполняются в сессии, которая создаётся при первом UI-шаге
+     *       через {@link #resolveOrClarifyStartUrl} и {@link UiExecutor#newSession}.
+     *       Провал {@link AssertionFailure} и {@link UiExecutor.UnsupportedUiOperation}
+     *       даёт FAILED, {@link UiExecutor.LocatorNotResolved} даёт уточнение (или
+     *       пропуск, если на тему уже есть ответ), прочие исключения — FAILED.
+     *       Исключения из {@code newSession} в этот блок не попадают и выходят из метода.</li>
+     *   <li>API-операции выполняются через {@link #executeApiOp}. Запрет хоста
+     *       ({@link TargetNotAllowedException}) — провал, а не уточнение. Ошибка apiCall,
+     *       похожая на ошибку конфигурации ({@link #isConfigError}), даёт уточнение по теме
+     *       {@code api_base_url}. Успешный apiCall обновляет тело, заголовки, статус и
+     *       признак доступных API-данных.</li>
+     *   <li>Неизвестная операция даёт провал {@code unknown-op}.</li>
+     * </ol>
+     * После всех шагов итог определяется по накопленным провалам и пропускам (см. класс).
+     * Браузерная сессия закрывается в {@code finally}.
+     *
+     * @param tc         разобранный тест-кейс; его тип определяет допустимые операции
+     * @param startUrl   стартовый URL для UI-шагов; может быть {@code null}, тогда берётся
+     *                   ответ на вопрос {@code start_url}
+     * @param apiBaseUrl базовый URL API; может быть {@code null}
+     * @param startStep  индекс первого шага (с 0); отрицательное значение трактуется как 0
+     * @return итог выполнения кейса
+     */
     public Result run(ParsedTestCase tc, String startUrl, String apiBaseUrl, int startStep) {
         String type = tc.type() == null ? "UI" : tc.type().trim().toUpperCase();
         boolean allowUi = !"API".equals(type);
@@ -88,8 +193,6 @@ public class HybridCaseRunner {
                     continue;
                 }
 
-                // Детерминированный препроцессор: если в будущих шагах есть сравнение,
-                // и модель забыла snapshotApiValue — добавляем его программно.
                 plans = maybeAddSnapshotForFutureCompare(plans, tc, i);
 
                 for (StepPlanner.Plan plan : plans) {
@@ -217,6 +320,11 @@ public class HybridCaseRunner {
                                 }
                             }
                         } catch (AssertionFailure af) {
+                            if (af instanceof TargetNotAllowedException) {
+                                enrichments.add(new StepEnrichment(i, op, "❌ " + af.getMessage()));
+                                failures.add("Шаг " + (i + 1) + ": " + af.getMessage());
+                                continue;
+                            }
                             if ("apicall".equals(op) && isConfigError(af.getMessage())) {
                                 String topicKey = "api_base_url";
                                 if (isSkippedInThisCase(tc, topicKey)
@@ -307,8 +415,14 @@ public class HybridCaseRunner {
         }
     }
 
-    // =========================== helpers ===========================
-
+    /**
+     * Истина для API-операций, которые проверяют уже полученный ответ и потому требуют
+     * успешного предыдущего apiCall: тело, заголовки, статус, {@code parseJson} и
+     * сравнение со снимком. Имена сравниваются в нижнем регистре.
+     *
+     * @param op имя операции в нижнем регистре
+     * @return {@code true}, если операция зависит от предыдущего apiCall
+     */
     private static boolean isApiAssert(String op) {
         return Set.of("assertbody", "assertbodyabsent",
                 "assertheader", "assertheaderabsent",
@@ -317,10 +431,19 @@ public class HybridCaseRunner {
     }
 
     /**
-     * Детерминированный препроцессор: если текущий шаг — apiCall,
-     * а в БУДУЩИХ шагах упоминается сравнение («сравнить», «идентичны»,
-     * «оба ответа» и т.д.), и модель забыла snapshotApiValue — добавляем
-     * snapshotApiValue программно.
+     * Препроцессор, который страхует модель от забытого снимка.
+     * <p>
+     * Добавляет {@code snapshotApiValue} в конец списка планов, если выполняются все условия:
+     * кейс не UI, план текущего шага содержит apiCall, в последующих шагах есть признак
+     * сравнения ({@link #COMPARE_HINT}), а снимка в плане ещё нет. Ключ снимка имеет вид
+     * {@code auto_step<N>} (N = номер текущего шага), jsonPath угадывается через
+     * {@link #guessJsonPath}. Для кейса типа UI список возвращается без изменений.
+     * Если тип кейса не задан, проверка UI не срабатывает, хотя выполнение его считает UI.
+     *
+     * @param plans       планы текущего шага; может быть {@code null}
+     * @param tc          тест-кейс
+     * @param currentStep индекс текущего шага, с 0
+     * @return исходный список либо его копия с добавленным снимком
      */
     private List<StepPlanner.Plan> maybeAddSnapshotForFutureCompare(
             List<StepPlanner.Plan> plans, ParsedTestCase tc, int currentStep) {
@@ -354,6 +477,14 @@ public class HybridCaseRunner {
         return result;
     }
 
+    /**
+     * Проверяет, содержит ли хотя бы один шаг после {@code currentStep} признак сравнения
+     * ({@link #COMPARE_HINT}).
+     *
+     * @param steps       шаги кейса; может быть {@code null}
+     * @param currentStep индекс текущего шага, с 0
+     * @return {@code true}, если найден признак сравнения в будущих шагах
+     */
     private boolean futureMentionsComparison(List<String> steps, int currentStep) {
         if (steps == null) return false;
         for (int j = currentStep + 1; j < steps.size(); j++) {
@@ -363,8 +494,17 @@ public class HybridCaseRunner {
     }
 
     /**
-     * Возвращает путь в формате JSON Pointer (RFC 6901), напр. "/hourly/temperature_2m".
-     * ApiExecutor дополнительно нормализует "$.hourly.temperature_2m" в тот же вид.
+     * Угадывает jsonPath для автоматического снимка по тексту будущих шагов.
+     * <p>
+     * Берётся первый идентификатор с точкой ({@link #JSON_PATH_HINT}) из шагов после текущего,
+     * точки заменяются на «/» и добавляется ведущий «/»: {@code hourly.temperature_2m}
+     * превращается в {@code /hourly/temperature_2m}. Если совпадения нет, возвращается
+     * корень {@code /}. Результат не проверяется на существование в ответе, поэтому
+     * ложное совпадение (например, в тексте «example.com») даст провал снимка.
+     *
+     * @param steps       шаги кейса; может быть {@code null}
+     * @param currentStep индекс текущего шага, с 0
+     * @return путь в формате JSON Pointer (RFC 6901)
      */
     private String guessJsonPath(List<String> steps, int currentStep) {
         if (steps == null) return "/";
@@ -377,20 +517,64 @@ public class HybridCaseRunner {
         return "/";
     }
 
+    /**
+     * Решение о стартовом URL для новой UI-сессии. Заполнено ровно одно из трёх полей:
+     * {@code url} (открыть сессию), {@code isSkip} (пропустить шаг) или
+     * {@code clarification} (запросить уточнение).
+     *
+     * @param url           действительный http(s)-URL; {@code null} для пропуска и уточнения
+     * @param isSkip        {@code true}, если шаг нужно пропустить по ответу пользователя
+     * @param clarification вопрос о стартовом URL; {@code null}, если URL уже известен
+     */
     private record StartUrlOutcome(String url, boolean isSkip, Clarification clarification) {
+
+        /**
+         * Решение «открыть сессию с этим URL».
+         *
+         * @param url действительный http(s)-URL
+         * @return исход с URL
+         */
         static StartUrlOutcome ok(String url) {
             return new StartUrlOutcome(url, false, null);
         }
 
+        /**
+         * Решение «пропустить шаг».
+         *
+         * @return исход пропуска
+         */
         static StartUrlOutcome skip() {
             return new StartUrlOutcome(null, true, null);
         }
 
+        /**
+         * Решение «запросить уточнение».
+         *
+         * @param c вопрос пользователю
+         * @return исход уточнения
+         */
         static StartUrlOutcome clarify(Clarification c) {
             return new StartUrlOutcome(null, false, c);
         }
     }
 
+    /**
+     * Определяет стартовый URL для UI-сессии.
+     * <p>
+     * Источник URL: {@code startUrl} из запроса, а при его отсутствии ответ на вопрос
+     * {@code start_url} (см. {@link #resolveStartUrl}). Действительным считается непустой
+     * URL, который начинается с {@code http://} или {@code https://} и не равен {@code SKIP}.
+     * Если URL действителен, возвращается {@link StartUrlOutcome#ok}. Иначе, если на тему
+     * {@code start_url} уже есть любой непустой ответ либо SKIP, шаг пропускается, даже
+     * когда ответ не является http(s)-URL. В остальных случаях возвращается уточнение.
+     *
+     * @param tc       тест-кейс
+     * @param startUrl стартовый URL из запроса; может быть {@code null}
+     * @param i        индекс текущего шага, с 0
+     * @param step     текст шага для вопроса пользователю
+     * @param enrichments отчёт, в который пишется запись о пропуске
+     * @return решение: URL, пропуск или уточнение
+     */
     private StartUrlOutcome resolveOrClarifyStartUrl(ParsedTestCase tc, String startUrl,
                                                      int i, String step,
                                                      List<StepEnrichment> enrichments) {
@@ -415,6 +599,19 @@ public class HybridCaseRunner {
         return StartUrlOutcome.clarify(c);
     }
 
+    /**
+     * Маршрутизирует UI-операцию в {@link UiExecutor}.
+     * <p>
+     * {@code snapshotUiText} сохраняет значение в {@code snapshots} под своим ключом.
+     * {@code assertUiTextEqualsSnapshot} сверяется с {@code snapshots}. Остальные
+     * операции выполняются через {@link UiExecutor#executeStep} с текущим URL страницы.
+     *
+     * @param uiSession браузерная сессия
+     * @param i         индекс шага, с 0
+     * @param plan      план шага
+     * @param snapshots снимки кейса, изменяемые операцией {@code snapshotUiText}
+     * @return enrichment шага
+     */
     private StepEnrichment executeUiOp(UiExecutor.UiSession uiSession, int i,
                                        StepPlanner.Plan plan,
                                        Map<String, String> snapshots) {
@@ -431,6 +628,23 @@ public class HybridCaseRunner {
         };
     }
 
+    /**
+     * Маршрутизирует API-операцию в {@link ApiExecutor}.
+     * <p>
+     * {@code snapshotApiValue} сохраняет значение в {@code snapshots}, результат без
+     * состояния ответа. {@code assertApiValueEqualsSnapshot} сверяется с {@code snapshots}.
+     * Остальные операции выполняются через {@link ApiExecutor#executeStep} с пустыми картами
+     * заголовков и параметров пути: заголовки кейса в этом пути не передаются.
+     *
+     * @param i           индекс шага, с 0
+     * @param plan        план шага
+     * @param apiBaseUrl  базовый URL API
+     * @param lastBody    тело последнего ответа
+     * @param lastHeaders заголовки последнего ответа
+     * @param lastStatus  статус последнего ответа
+     * @param snapshots   снимки кейса
+     * @return enrichment шага и результат apiCall-подобного шага или {@code null}
+     */
     private ApiOpResult executeApiOp(int i, StepPlanner.Plan plan, String apiBaseUrl,
                                      String lastBody, Map<String, String> lastHeaders,
                                      Integer lastStatus, Map<String, String> snapshots) {
@@ -456,6 +670,17 @@ public class HybridCaseRunner {
         };
     }
 
+    /**
+     * Распознаёт сообщения об ошибках конфигурации или недоступности API.
+     * <p>
+     * Проверяются подстроки в нижнем регистре: неизвестный протокол, отсутствие хоста,
+     * {@code api_base_url}, отказ соединения, таймаут, «не отвечает», некорректный
+     * абсолютный URL, незаданный базовый URL. Такой провал apiCall переводится
+     * в уточнение по теме {@code api_base_url}.
+     *
+     * @param msg текст ошибки; может быть {@code null}
+     * @return {@code true}, если сообщение похоже на ошибку конфигурации
+     */
     private static boolean isConfigError(String msg) {
         if (msg == null) return false;
         String m = msg.toLowerCase();
@@ -471,6 +696,18 @@ public class HybridCaseRunner {
                 || m.contains("не задан корректный apibaseurl");
     }
 
+    /**
+     * Возвращает стартовый URL из запроса либо ответ на вопрос {@code start_url}.
+     * <p>
+     * Непустой {@code fallback} возвращается без проверки. Иначе ищется ответ с темой
+     * {@code start_url} (без учёта регистра): обрезанный ответ, если он не пуст и не равен
+     * {@code SKIP}, либо {@code null} для пустого ответа и {@code SKIP}. Если такого ответа нет,
+     * возвращается {@code fallback}.
+     *
+     * @param tc       тест-кейс с ответами пользователя
+     * @param fallback URL из запроса; может быть {@code null} или пустым
+     * @return стартовый URL, {@code null} либо значение {@code fallback}
+     */
     private String resolveStartUrl(ParsedTestCase tc, String fallback) {
         if (fallback != null && !fallback.isBlank()) return fallback;
         if (tc.answers() == null) return null;
@@ -487,6 +724,16 @@ public class HybridCaseRunner {
         return fallback;
     }
 
+    /**
+     * Проверяет, ответил ли пользователь {@code SKIP} на вопрос по теме {@code topicKey}.
+     * <p>
+     * Ответ с точным совпадением темы (без учёта регистра) учитывается. Ответ без темы
+     * учитывается, если тема входит в текст его вопроса.
+     *
+     * @param tc       тест-кейс с ответами пользователя
+     * @param topicKey тема вопроса; {@code null} или пустая строка дают {@code false}
+     * @return {@code true}, если на эту тему получен {@code SKIP}
+     */
     private boolean isSkippedInThisCase(ParsedTestCase tc, String topicKey) {
         if (topicKey == null || topicKey.isBlank() || tc.answers() == null) return false;
         String needle = topicKey.trim().toLowerCase();
@@ -503,6 +750,15 @@ public class HybridCaseRunner {
         return false;
     }
 
+    /**
+     * Возвращает первый непустой ответ пользователя на вопрос по теме {@code topicKey}.
+     * Сопоставление тем такое же, как в {@link #isSkippedInThisCase}. Ответ {@code SKIP}
+     * тоже возвращается, так что проверка {@code != null} срабатывает и для него.
+     *
+     * @param tc       тест-кейс с ответами пользователя
+     * @param topicKey тема вопроса; {@code null} или пустая строка дают {@code null}
+     * @return текст ответа либо {@code null}, если ответа нет
+     */
     private String findAnswerInThisCase(ParsedTestCase tc, String topicKey) {
         if (topicKey == null || topicKey.isBlank() || tc.answers() == null) return null;
         String needle = topicKey.trim().toLowerCase();
@@ -519,6 +775,19 @@ public class HybridCaseRunner {
         return null;
     }
 
+    /**
+     * Нормализует тему вопроса к виду, пригодному для сопоставления с ответами.
+     * <p>
+     * Если тема задана планом, она приводится к нижнему регистру, символы вне
+     * {@code [a-z0-9_]} заменяются на «_», длина ограничивается 40 символами. Иначе тема
+     * строится из причины: нижний регистр, символы вне {@code [a-z0-9]} заменяются на
+     * «_». Причина без латинских букв и цифр даёт тему «_», поэтому разные такие причины
+     * сливаются в одну тему. Пустой результат заменяется на {@code clarification}.
+     *
+     * @param topicKey тема из плана; может быть {@code null}
+     * @param reason   причина или текст ошибки; может быть {@code null}
+     * @return нормализованная тема длиной не более 40 символов
+     */
     private String normalizeTopic(String topicKey, String reason) {
         if (topicKey != null && !topicKey.isBlank()) {
             String t = topicKey.trim().toLowerCase().replaceAll("[^a-z0-9_]+", "_");
@@ -531,6 +800,14 @@ public class HybridCaseRunner {
         return base.length() > 40 ? base.substring(0, 40) : base;
     }
 
+    /**
+     * Добавляет префикс {@code [topic] } к тексту вопроса, чтобы ответ можно было
+     * сопоставить с темой. Если тема не задана, текст возвращается как есть.
+     *
+     * @param question текст вопроса; может быть {@code null}
+     * @param topicKey тема вопроса; может быть {@code null} или пустой
+     * @return вопрос с префиксом либо без него
+     */
     private String withTopic(String question, String topicKey) {
         if (topicKey == null || topicKey.isBlank()) return question;
         return "[" + topicKey + "] " + (question == null ? "" : question);

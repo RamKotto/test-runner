@@ -4,7 +4,9 @@ import application.config.AppProperties;
 import application.dto.Dtos.ElementInfo;
 import application.dto.Dtos.StepEnrichment;
 import application.exception.AssertionFailure;
+import application.exception.TargetNotAllowedException;
 import com.microsoft.playwright.*;
+import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -15,36 +17,187 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * Исполнитель UI-шагов тест-кейса на базе Playwright (Chromium).
+ * <p>
+ * Место в конвейере: {@link HybridCaseRunner} открывает браузерную сессию
+ * через {@link #newSession(String)} и передаёт сюда UI-шаги, которые
+ * {@link StepPlanner} пометил как браузерные. Поддерживаются операции
+ * {@code navigate}, {@code click}, {@code fill}, {@code assertText},
+ * {@code waitForText}, {@code assertPageText}, а также снимок и сравнение
+ * текста элемента ({@code snapshotUiText}, {@code assertUiTextEqualsSnapshot}).
+ * <p>
+ * Ошибки, которые означают провал теста, выбрасываются как
+ * {@link AssertionFailure}; неполный или неоднозначный план — как
+ * {@link LocatorNotResolved}, то есть запрос уточнения у пользователя.
+ * Переход на хост вне {@code app.target.allowed-hosts} отклоняется через
+ * {@link TargetUrlGuard}.
+ * <p>
+ * Экземпляр создаётся Spring-ом: конструктор запускает Playwright и Chromium,
+ * метод {@link #shutdown()} останавливает их при остановке контекста.
+ */
 @Slf4j
 @Service
 public class UiExecutor {
 
+    /**
+     * Корневой объект Playwright, владеющий драйвером браузера.
+     */
     private final Playwright playwright;
+
+    /**
+     * Общий экземпляр Chromium. Каждая сессия создаёт из него изолированный контекст.
+     */
     private final Browser browser;
+
+    /**
+     * Настройки приложения: headless-режим, таймауты Playwright, каталог для HTML-дампов.
+     */
     private final AppProperties appProps;
 
+    /**
+     * Проверка allowlist-а хостов для стартового URL, навигации и маршрутизации запросов.
+     */
+    private final TargetUrlGuard targetUrlGuard;
+
+    /**
+     * Флаг сохранения HTML страницы после шагов (свойство {@code app.debug.dump-html},
+     * по умолчанию {@code false}). Внедряется Spring-ом.
+     */
     @Value("${app.debug.dump-html:false}")
     private boolean dumpHtmlEnabled;
 
-    public UiExecutor(AppProperties appProps) {
+    /**
+     * Запускает Playwright и Chromium с настройками {@code app.playwright}.
+     *
+     * @param appProps       настройки приложения
+     * @param targetUrlGuard защита от перехода на хосты вне allowlist-а
+     */
+    public UiExecutor(AppProperties appProps, TargetUrlGuard targetUrlGuard) {
         this.appProps = appProps;
+        this.targetUrlGuard = targetUrlGuard;
         this.playwright = Playwright.create();
         this.browser = playwright.chromium().launch(
                 new BrowserType.LaunchOptions().setHeadless(appProps.getPlaywright().isHeadless()));
         log.info("Playwright запущен (headless={})", appProps.getPlaywright().isHeadless());
     }
 
+    /**
+     * Создаёт новую изолированную браузерную сессию и при необходимости открывает стартовый URL.
+     * <p>
+     * Стартовый URL проверяется через {@link #requireAllowedUiUrl(String, String)} до
+     * создания контекста. В контексте установлен маршрутизатор: навигационные запросы
+     * (включая редиректы) на хосты вне allowlist-а отменяются, остальные запросы
+     * пропускаются. Subresource-запросы не блокируются, иначе страницы перестанут работать.
+     * Таймауты действий и навигации берутся из {@code app.playwright}.
+     * <p>
+     * Если открыть стартовый URL не удалось, контекст закрывается и исключение пробрасывается.
+     *
+     * @param startUrl стартовый URL; {@code null} или пустая строка означают
+     *                 создание сессии без навигации
+     * @return открытая сессия; её нужно закрыть через {@link UiSession#close()}
+     * @throws AssertionFailure          стартовый URL не является http(s)-адресом либо
+     *                                   браузер не смог открыть страницу (в том числе из-за
+     *                                   редиректа на запрещённый хост)
+     * @throws TargetNotAllowedException стартовый URL указывает на хост вне allowlist-а
+     */
     public UiSession newSession(String startUrl) {
-        BrowserContext ctx = browser.newContext();
-        Page page = ctx.newPage();
-        page.setDefaultTimeout(appProps.getPlaywright().getActionTimeoutMs());
-        page.setDefaultNavigationTimeout(appProps.getPlaywright().getNavigationTimeoutMs());
-        if (startUrl != null && !startUrl.isBlank()) {
-            page.navigate(startUrl);
+        boolean hasStart = startUrl != null && !startUrl.isBlank();
+        if (hasStart) {
+            requireAllowedUiUrl(startUrl, "стартовый URL");
         }
-        return new UiSession(ctx, page);
+        BrowserContext ctx = browser.newContext();
+        try {
+            ctx.route("**/*", route -> {
+                Request request = route.request();
+                if (request.isNavigationRequest() && !targetUrlGuard.isAllowed(request.url())) {
+                    log.warn("UI: навигация на {} заблокирована (хост вне app.target.allowed-hosts)",
+                            request.url());
+                    route.abort();
+                } else {
+                    route.resume();
+                }
+            });
+            Page page = ctx.newPage();
+            page.setDefaultTimeout(appProps.getPlaywright().getActionTimeoutMs());
+            page.setDefaultNavigationTimeout(appProps.getPlaywright().getNavigationTimeoutMs());
+            if (hasStart) {
+                try {
+                    page.navigate(startUrl);
+                } catch (PlaywrightException e) {
+                    throw new AssertionFailure("Не удалось открыть стартовый URL " + startUrl
+                            + " (возможно, перенаправление на хост вне app.target.allowed-hosts): "
+                            + truncate(e.getMessage(), 300), e);
+                }
+            }
+            return new UiSession(ctx, page);
+        } catch (RuntimeException e) {
+            try {
+                ctx.close();
+            } catch (Exception ignored) {
+            }
+            throw e;
+        }
     }
 
+    /**
+     * Проверяет URL, который будет открыт в браузере: он должен быть абсолютным
+     * http(s)-адресом и входить в {@code app.target.allowed-hosts}.
+     *
+     * @param url  проверяемый URL
+     * @param what человеческое название URL для текста ошибки, например «стартовый URL»
+     * @throws AssertionFailure          URL не является абсолютным http(s)-адресом
+     * @throws TargetNotAllowedException хост URL не входит в allowlist
+     */
+    private void requireAllowedUiUrl(String url, String what) {
+        String host = targetUrlGuard.hostOf(url);
+        if (host == null) {
+            throw new AssertionFailure("некорректный " + what + " (нужен http(s)://host/...): `"
+                    + url + "`");
+        }
+        if (!targetUrlGuard.isAllowed(url)) {
+            throw new TargetNotAllowedException("Хост не разрешён для UI: " + host
+                    + ". Добавьте его в app.target.allowed-hosts");
+        }
+    }
+
+    /**
+     * Закрывает браузер и останавливает Playwright при остановке контекста Spring.
+     * Ошибка закрытия браузера не мешает остановке Playwright, и наоборот; обе
+     * ошибки логируются как предупреждения.
+     */
+    @PreDestroy
+    public void shutdown() {
+        try {
+            browser.close();
+        } catch (Exception e) {
+            log.warn("Не удалось закрыть браузер: {}", e.getMessage());
+        }
+        try {
+            playwright.close();
+        } catch (Exception e) {
+            log.warn("Не удалось остановить Playwright: {}", e.getMessage());
+        }
+        log.info("Playwright и браузер остановлены");
+    }
+
+    /**
+     * Строит текстовый снимок DOM страницы для планировщика LLM.
+     * <p>
+     * Обходится дерево от {@code document.body}. В снимок попадают только
+     * «интересные» элементы: интерактивные и структурные теги (ссылки, кнопки,
+     * поля ввода, заголовки, таблицы, навигация и т.п.), а также элементы с
+     * {@code id}, {@code data-testid}, {@code role}, {@code aria-label} или классом
+     * из набора признаков (btn, button, link, input, card, nav, menu, modal, form,
+     * code, pre). Каждая строка имеет вид {@code <tag атрибуты> "текст"}, отступ
+     * равен глубине вложенности среди включённых элементов. Атрибуты {@code value},
+     * {@code checked}, {@code selected} и {@code disabled} выводятся по состоянию
+     * DOM, а не по HTML-атрибутам.
+     *
+     * @param session сессия, страница которой снимается
+     * @return текст снимка, строки разделены {@code \n}; пустая строка при ошибке
+     *         выполнения JavaScript (ошибка логируется на уровне debug)
+     */
     public String snapshotForPlanning(UiSession session) {
         try {
             return (String) session.page().evaluate("""
@@ -120,6 +273,38 @@ public class UiExecutor {
         }
     }
 
+    /**
+     * Выполняет одну UI-операцию шага: {@code navigate}, {@code click}, {@code fill},
+     * {@code assertText}, {@code waitForText} или {@code assertPageText}.
+     * <p>
+     * Поведение по операциям:
+     * <ul>
+     *   <li>{@code navigate}: переход на {@code plan.value()}, а при его отсутствии
+     *       на {@code currentUrl}. URL проверяется по allowlist-у. Ошибка Playwright
+     *       здесь не перехватывается.</li>
+     *   <li>{@code click}, {@code fill}: локаторы разрешаются строго. Неоднозначный
+     *       локатор, то есть матчящий более одного элемента, даёт {@link LocatorNotResolved}.
+     *       Ошибка действия над элементом превращается в {@link AssertionFailure}.</li>
+     *   <li>{@code assertText}: проверяет, что {@code innerText} каждого найденного
+     *       элемента содержит ожидаемый текст. Неоднозначность допускается. Все
+     *       несовпадения собираются и выбрасываются одним {@link AssertionFailure}.</li>
+     *   <li>{@code waitForText}: ждёт появления текста в {@code document.documentElement}
+     *       не дольше 10 секунд. Таймаут не зависит от {@code app.playwright}.</li>
+     *   <li>{@code assertPageText}: проверяет текст {@code body} без ожидания.</li>
+     * </ul>
+     * Любая другая операция, включая {@code null}, отклоняется.
+     *
+     * @param session     сессия, в которой выполняется шаг
+     * @param stepIndex   индекс шага, начиная с 0 (в отчёте выводится +1)
+     * @param plan        план шага от LLM
+     * @param currentUrl  текущий URL страницы, используется как цель {@code navigate} без значения;
+     *                    может быть {@code null}
+     * @return enrichment шага с описанием найденных элементов
+     * @throws AssertionFailure              проверка не прошла или действие над элементом не удалось
+     * @throws LocatorNotResolved            не хватает значения, локатор не найден или неоднозначен
+     * @throws TargetNotAllowedException     URL навигации вне allowlist-а
+     * @throws UnsupportedUiOperation        операция не относится к UI-исполнителю
+     */
     public StepEnrichment executeStep(UiSession session, int stepIndex,
                                       StepPlanner.Plan plan, String currentUrl) {
         Page page = session.page();
@@ -129,6 +314,7 @@ public class UiExecutor {
                 String url = plan.value() != null && !plan.value().isBlank()
                         ? plan.value() : currentUrl;
                 if (url == null) throw new LocatorNotResolved("не указан URL для навигации");
+                requireAllowedUiUrl(url, "URL для навигации");
                 page.navigate(url);
                 return StepEnrichment.ui(stepIndex, "navigate",
                         "navigate\n   • url: `" + page.url() + "`", List.of());
@@ -236,8 +422,20 @@ public class UiExecutor {
         }
     }
 
-    // ---- snapshot/compare UI ----
-
+    /**
+     * Снимает текст или атрибут единственного элемента в именованный слот снимка.
+     * <p>
+     * Элемент разрешается нестрого ({@code strictAmbiguity = false}), но результат
+     * обязан содержать ровно один элемент. Атрибут берётся из {@code plan.attribute()};
+     * по умолчанию это {@code innerText}. Значение читает {@link #readUiValue}.
+     *
+     * @param session   сессия, страница которой снимается
+     * @param stepIndex индекс шага, начиная с 0
+     * @param plan      план шага; нужны {@code snapshotKey} и локатор
+     * @return результат со слотом снимка, значением и enrichment
+     * @throws LocatorNotResolved            ключ снимка не указан, либо найдено не ровно 1 элемент
+     * @throws AssertionFailure              значение элемента не удалось прочитать
+     */
     public SnapshotResult snapshotUiText(UiSession session, int stepIndex, StepPlanner.Plan plan) {
         String key = requireSnapshotKey(plan.snapshotKey());
         List<ElementInfo> elements = resolveAllElements(session.page(), plan, false);
@@ -260,6 +458,22 @@ public class UiExecutor {
                 key, value);
     }
 
+    /**
+     * Сравнивает текущее значение единственного элемента со снимком того же ключа.
+     * <p>
+     * Наличие снимка проверяется до поиска элемента. Элемент разрешается нестрого и
+     * должен быть единственным. Сравнение строгое, по строкам. При расхождении в
+     * сообщении ошибки приводятся ожидаемое и фактическое значения, обрезанные
+     * до 300 символов.
+     *
+     * @param session   сессия, страница которой проверяется
+     * @param stepIndex индекс шага, начиная с 0
+     * @param plan      план шага; нужны {@code snapshotKey} и локатор
+     * @param snapshots снимки кейса по ключам; может быть {@code null}
+     * @return enrichment шага при совпадении значений
+     * @throws AssertionFailure   снимка нет, значение не удалось прочитать или значения различаются
+     * @throws LocatorNotResolved ключ не указан либо найдено не ровно 1 элемент
+     */
     public StepEnrichment assertUiTextEqualsSnapshot(UiSession session, int stepIndex,
                                                      StepPlanner.Plan plan,
                                                      Map<String, String> snapshots) {
@@ -300,6 +514,23 @@ public class UiExecutor {
                 detail.toString(), elements);
     }
 
+    /**
+     * Читает значение атрибута из первого элемента по локатору.
+     * <p>
+     * Значения нормализуются так:
+     * <ul>
+     *   <li>{@code innerText} и {@code textContent}: обрезка пробелов по краям,
+     *       последовательности пробельных символов сжимаются до одного пробела;</li>
+     *   <li>{@code value}: свойство {@code value} элемента, {@code null} превращается в пустую строку;</li>
+     *   <li>любой другой атрибут: {@code getAttribute}, отсутствующее значение даёт пустую строку.</li>
+     * </ul>
+     *
+     * @param page    страница, на которой ищется элемент
+     * @param locator локатор, из которого берётся первый элемент
+     * @param attr    имя свойства или атрибута
+     * @return прочитанное значение, никогда не {@code null}
+     * @throws AssertionFailure ошибка чтения элемента
+     */
     private String readUiValue(Page page, String locator, String attr) {
         Locator loc = page.locator(locator).first();
         try {
@@ -327,6 +558,13 @@ public class UiExecutor {
         }
     }
 
+    /**
+     * Проверяет ключ снимка и возвращает его без пробелов по краям.
+     *
+     * @param k ключ из плана; может быть {@code null}
+     * @return нормализованный ключ
+     * @throws LocatorNotResolved ключ отсутствует или пуст
+     */
     private static String requireSnapshotKey(String k) {
         if (k == null || k.isBlank()) {
             throw new LocatorNotResolved(
@@ -335,16 +573,36 @@ public class UiExecutor {
         return k.trim();
     }
 
+    /**
+     * Обрезает строку до {@code max} символов и добавляет «…», если она длиннее.
+     *
+     * @param s   исходная строка; может быть {@code null}
+     * @param max максимальная длина без многоточия
+     * @return обрезанная строка либо пустая строка для {@code null}
+     */
     private static String truncate(String s, int max) {
         if (s == null) return "";
         return s.length() <= max ? s : s.substring(0, max) + "…";
     }
 
+    /**
+     * Результат операции {@code snapshotUiText}.
+     *
+     * @param enrichment запись для отчёта
+     * @param key        имя слота снимка, из {@code plan.snapshotKey()}
+     * @param value      прочитанное значение элемента
+     */
     public record SnapshotResult(StepEnrichment enrichment, String key, String value) {
     }
 
-    // ---- существующие helpers ----
-
+    /**
+     * Дописывает в отчёт описание одного элемента: локатор, число совпадений,
+     * тег с основными атрибутами, текст, XPath и альтернативные CSS-локаторы.
+     * Пустые и {@code null}-поля пропускаются.
+     *
+     * @param sb отчёт, в который дописывается описание
+     * @param el описываемый элемент
+     */
     private void appendElementDetail(StringBuilder sb, ElementInfo el) {
         sb.append("     locator: `").append(el.locator()).append("`\n");
         if (el.count() != null) sb.append("     matches: ").append(el.count()).append("\n");
@@ -369,6 +627,23 @@ public class UiExecutor {
         }
     }
 
+    /**
+     * Разрешает все элементы плана в {@link ElementInfo} и проверяет их количество.
+     * <p>
+     * Для каждой цели {@code plan.effectiveElements()} считается число совпадений.
+     * Локатор, который не удалось вычислить, не находит элементов или (при
+     * {@code strictAmbiguity}) находит больше одного, даёт {@link LocatorNotResolved}.
+     * В сообщении о неоднозначности перечисляются кандидаты с тегом, id, data-testid,
+     * role, aria-label и текстом, а ключ роли берётся из {@code elementRole} плана
+     * или равен {@code "element"}. Нестрогий режим возвращает все совпадения;
+     * если их несколько, у локатора добавляется суффикс {@code >> nth=i}.
+     *
+     * @param page             страница, на которой вычисляются локаторы
+     * @param plan             план шага с целями элементов
+     * @param strictAmbiguity  {@code true} требует единственного совпадения на каждую цель
+     * @return элементы всех целей в порядке плана; индекс {@link ElementInfo#index()} сквозной
+     * @throws LocatorNotResolved план не содержит целей, локатор некорректен, не найден или неоднозначен
+     */
     public List<ElementInfo> resolveAllElements(Page page, StepPlanner.Plan plan,
                                                 boolean strictAmbiguity) {
         List<StepPlanner.ElementTarget> targets = plan.effectiveElements();
@@ -430,6 +705,27 @@ public class UiExecutor {
         return result;
     }
 
+    /**
+     * Собирает {@link ElementInfo} для одного совпадения локатора.
+     * <p>
+     * Атрибуты читаются через {@link #safeAttr}, текст через {@link #safeInnerText}.
+     * Для {@code data-testid}, {@code data-test-id} и {@code data-test} приоритет
+     * выше {@code id}: в {@code testidOrId} попадает первое найденное из них.
+     * Альтернативы из {@code t.alternatives()} делятся на два набора. Префикс
+     * {@code xpath=} снимается. Строки, начинающиеся с {@code //}, {@code /html}
+     * или {@code ./}, считаются XPath и попадают в {@code alternativesXpath}
+     * без дублей. Остальные строки попадают в {@code alternativesCss}, даже если
+     * это не CSS (например, {@code text=} или {@code role=}). Вычисленный на странице
+     * XPath ставится первым в {@code alternativesXpath}.
+     *
+     * @param page              страница, на которой ищется элемент
+     * @param el                конкретное совпадение локатора
+     * @param t                 цель плана, из которой взяты альтернативы и роль
+     * @param index             сквозной индекс элемента в шаге
+     * @param count             общее число совпадений локатора
+     * @param individualLocator локатор, однозначно указывающий на этот элемент
+     * @return описание элемента для отчёта и для планировщика
+     */
     private ElementInfo inspectLocator(Page page, Locator el, StepPlanner.ElementTarget t,
                                        int index, int count, String individualLocator) {
         String tag = safeString(evaluate(el, "e => e.tagName ? e.tagName.toLowerCase() : ''"));
@@ -470,6 +766,21 @@ public class UiExecutor {
                 altsCss, altsXpath);
     }
 
+    /**
+     * Вычисляет в браузере XPath первого элемента по локатору.
+     * <p>
+     * Приоритеты построения: {@code data-testid}, затем {@code id}. Для кнопок,
+     * ссылок и заголовков с текстом не длиннее 60 символов без переносов строк
+     * используется {@code normalize-space()}. Во всех остальных случаях строится
+     * путь от ближайшего предка с {@code id} или {@code data-testid} (либо от
+     * корня) с индексами одноимённых соседей. Одинарные кавычки в значениях
+     * экранируются обратным слешем.
+     *
+     * @param page    страница, на которой вычисляется XPath
+     * @param locator локатор; берётся первый элемент
+     * @return XPath либо {@code null}, если элемент не найден или скрипт завершился ошибкой
+     *         (ошибка логируется на уровне debug)
+     */
     private String computeXPath(Page page, String locator) {
         try {
             Locator loc = page.locator(locator);
@@ -516,6 +827,13 @@ public class UiExecutor {
         }
     }
 
+    /**
+     * Читает атрибут элемента, не выбрасывая исключений Playwright.
+     *
+     * @param loc  локатор элемента
+     * @param name имя атрибута
+     * @return значение атрибута или {@code null}, если атрибута нет, он пуст или чтение завершилось ошибкой
+     */
     private String safeAttr(Locator loc, String name) {
         try {
             String v = loc.getAttribute(name);
@@ -525,6 +843,12 @@ public class UiExecutor {
         }
     }
 
+    /**
+     * Возвращает {@code innerText} элемента, не выбрасывая исключений Playwright.
+     *
+     * @param loc локатор элемента
+     * @return текст или {@code null} при ошибке
+     */
     private String safeInnerText(Locator loc) {
         try {
             return loc.innerText();
@@ -533,6 +857,13 @@ public class UiExecutor {
         }
     }
 
+    /**
+     * Выполняет JavaScript-выражение над элементом, не выбрасывая исключений.
+     *
+     * @param loc  локатор элемента
+     * @param expr JavaScript-функция вида {@code e => ...}
+     * @return результат выполнения или {@code null} при ошибке
+     */
     private Object evaluate(Locator loc, String expr) {
         try {
             return loc.evaluate(expr);
@@ -541,10 +872,28 @@ public class UiExecutor {
         }
     }
 
+    /**
+     * Приводит значение к строке.
+     *
+     * @param o значение; может быть {@code null}
+     * @return {@code o.toString()} либо {@code null}
+     */
     private String safeString(Object o) {
         return o == null ? null : o.toString();
     }
 
+    /**
+     * Обрезает текст для отчёта, стараясь не разрывать строки и слова.
+     * <p>
+     * Если строка длиннее {@code max}, обрезка выполняется по последнему переводу строки
+     * или пробелу, но только если он находится во второй половине лимита; тогда к
+     * результату добавляется «…». Иначе строка обрезается ровно по {@code max} символам.
+     * Результат может превышать {@code max} на служебные символы «…» или перевода строки.
+     *
+     * @param s   исходная строка; может быть {@code null}
+     * @param max предельная длина без многоточия
+     * @return обрезанная строка или пустая строка для {@code null}
+     */
     private static String truncateSmart(String s, int max) {
         if (s == null) return "";
         if (s.length() <= max) return s;
@@ -555,6 +904,13 @@ public class UiExecutor {
         return s.substring(0, max) + "…";
     }
 
+    /**
+     * Экранирует текст для вставки в отчёт внутри двойных кавычек.
+     * Экранируются {@code "}, {@code \}, перевод строки, табуляция и возврат каретки.
+     *
+     * @param s исходная строка; может быть {@code null}
+     * @return экранированная строка или пустая строка для {@code null}
+     */
     private static String escapeQuotes(String s) {
         if (s == null) return "";
         StringBuilder sb = new StringBuilder(s.length());
@@ -572,6 +928,12 @@ public class UiExecutor {
         return sb.toString();
     }
 
+    /**
+     * Возвращает URL текущей страницы сессии.
+     *
+     * @param session сессия браузера
+     * @return URL страницы или {@code null}, если его не удалось получить
+     */
     public String currentUrl(UiSession session) {
         try {
             return session.page().url();
@@ -580,6 +942,18 @@ public class UiExecutor {
         }
     }
 
+    /**
+     * Сохраняет HTML текущей страницы в {@code app.download.directory} для отладки.
+     * <p>
+     * Ничего не делает, если {@code app.debug.dump-html} выключен. Имя файла имеет вид
+     * {@code <testCaseId>.step<N>.html}, где {@code N} равен {@code stepIndex + 1}.
+     * Значение {@code testCaseId} в имени файла не санитизируется. Ошибки записи
+     * логируются на уровне debug и не пробрасываются.
+     *
+     * @param session    сессия, страница которой сохраняется
+     * @param testCaseId идентификатор тест-кейса, используется в имени файла
+     * @param stepIndex  индекс шага, начиная с 0
+     */
     public void dumpHtml(UiSession session, String testCaseId, int stepIndex) {
         if (!dumpHtmlEnabled) return;
         try {
@@ -593,19 +967,48 @@ public class UiExecutor {
         }
     }
 
+    /**
+     * Браузерная сессия одного прогона: изолированный контекст и открытая страница.
+     * <p>
+     * Создаётся только через {@link UiExecutor#newSession(String)}. Метод
+     * {@link #close()} закрывает контекст и глушит ошибки закрытия, поэтому
+     * повторный вызов безопасен.
+     */
     public static final class UiSession implements AutoCloseable {
+
+        /**
+         * Контекст браузера, которому принадлежит страница.
+         */
         private final BrowserContext context;
+
+        /**
+         * Текущая страница сессии.
+         */
         private final Page page;
 
+        /**
+         * Создаёт сессию из уже открытого контекста и страницы.
+         *
+         * @param context контекст браузера
+         * @param page    страница в этом контексте
+         */
         UiSession(BrowserContext context, Page page) {
             this.context = context;
             this.page = page;
         }
 
+        /**
+         * Возвращает страницу сессии.
+         *
+         * @return страница Playwright
+         */
         public Page page() {
             return page;
         }
 
+        /**
+         * Закрывает контекст браузера. Ошибки закрытия игнорируются.
+         */
         @Override
         public void close() {
             try {
@@ -615,24 +1018,62 @@ public class UiExecutor {
         }
     }
 
+    /**
+     * Сигнал, что план не содержит достаточно данных для выполнения шага: нет
+     * значения или URL, локатор не найден либо неоднозначен.
+     * <p>
+     * Это не провал теста, а запрос уточнения. Исполнители выбрасывают его там, где
+     * проверка не может быть выполнена, а не там, где проверка не прошла
+     * ({@link AssertionFailure}).
+     */
     public static final class LocatorNotResolved extends RuntimeException {
+
+        /**
+         * Ключ роли элемента для формирования вопроса пользователю; может быть {@code null}.
+         */
         private final String roleKey;
 
+        /**
+         * Создаёт исключение без ключа роли.
+         *
+         * @param message причина, которая попадёт в вопрос пользователю
+         */
         public LocatorNotResolved(String message) {
             this(message, null);
         }
 
+        /**
+         * Создаёт исключение с ключом роли элемента.
+         *
+         * @param message причина, которая попадёт в вопрос пользователю
+         * @param roleKey ключ роли элемента либо {@code null}
+         */
         public LocatorNotResolved(String message, String roleKey) {
             super(message);
             this.roleKey = roleKey;
         }
 
+        /**
+         * Возвращает ключ роли элемента, с которым было создано исключение.
+         *
+         * @return ключ роли либо {@code null}
+         */
         public String roleKey() {
             return roleKey;
         }
     }
 
+    /**
+     * Операция плана не поддерживается UI-исполнителем. Такой шаг не относится к браузеру
+     * и должен маршрутизироваться в другой исполнитель.
+     */
     public static final class UnsupportedUiOperation extends RuntimeException {
+
+        /**
+         * Создаёт исключение для неподдерживаемой операции.
+         *
+         * @param op имя операции из плана
+         */
         public UnsupportedUiOperation(String op) {
             super("UIExecutor не поддерживает операцию: " + op);
         }
