@@ -48,14 +48,15 @@ public class OpenRouterClient {
     /**
      * Отправляет запрос к модели и возвращает текст ответа.
      * <p>
-     * Запрос фиксирует недетерминизм модели: {@code temperature=0}, {@code top_p=1}
-     * (жадное декодирование) и {@code seed=42}. Провайдеры, которые поддерживают seed,
+     * Запрос фиксирует недетерминизм модели: {@code temperature=0} (жадное декодирование),
+     * {@code top_p=1} (без отсечения по nucleus) и {@code seed=42}. Провайдеры, которые поддерживают seed,
      * дают воспроизводимые ответы. Режим рассуждений задан как {@code effort=high}.
      * <p>
      * Текст ответа берётся из {@code choices[0].message.content}. Если он пуст, используются
      * по порядку {@code reasoning_content} и аргументы первого {@code tool_calls}.
-     * Если и они пусты, запрос считается неудачным. Ошибки HTTP логируются с обрезанным
-     * телом ответа.
+     * Если и они пусты, запрос считается неудачным. Ошибка HTTP не логируется отдельно: её текст с телом
+     * ответа, обрезанным до 800 символов, попадает в сообщение {@link GenerationException}.
+     * Ответы без {@code choices}, {@code message} или content логируются с обрезкой до 2000 символов.
      *
      * @param systemPrompt системный промпт
      * @param userText     пользовательский текст
@@ -65,6 +66,10 @@ public class OpenRouterClient {
      */
     @SuppressWarnings("unchecked")
     public String complete(String systemPrompt, String userText) {
+        // Map.of и List.of не принимают null и бросили бы NPE до входа в try: ответ был бы 500 вместо 502.
+        if (systemPrompt == null || userText == null) {
+            throw new GenerationException("Не заданы системный промпт или текст для запроса к OpenRouter");
+        }
         Map<String, Object> body = new HashMap<>();
         body.put("model", props.getModel());
         body.put("messages", List.of(

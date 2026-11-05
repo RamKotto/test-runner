@@ -4,14 +4,14 @@ import application.config.AppProperties;
 import application.dto.Dtos.ParsedTestCase;
 import application.exception.FetchException;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestClient;
 
 import java.net.URI;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -20,14 +20,33 @@ import java.util.stream.Collectors;
 /**
  * Скачивание тест-кейсов по HTTP(S) с поддержкой индекса {@code _index.md} и версий файлов.
  * <p>
- * Место в конвейере: {@code RunController} вызывает {@link #fetchAll(String)} и получает
- * список {@link ParsedTestCase}, который передаётся в {@link TestCaseRunnerService}.
- * Каждый скачанный файл сохраняется копией в {@code app.download.directory}. Хосты
- * ограничены списком {@code app.download.allowed-hosts}.
+ * Место в конвейере: {@code RunController} вызывает {@link #fetch(String)} и получает список
+ * {@link ParsedTestCase} для {@link TestCaseRunnerService} и список скачанных файлов
+ * ({@link FetchedArtifact}), которые контроллер сохраняет артефактами прогона в БД. Диск не используется.
+ * Хосты ограничены списком {@code app.download.allowed-hosts}.
  */
 @Slf4j
 @Service
 public class TestCaseFetcher {
+
+    /**
+     * Скачанный файл, который нужно сохранить артефактом прогона.
+     *
+     * @param kind     вид артефакта: {@code test_case} для кейсов, {@code index} для индекса
+     * @param filename имя файла (с учётом версии, если она была найдена)
+     * @param content  текст файла
+     */
+    public record FetchedArtifact(String kind, String filename, String content) {
+    }
+
+    /**
+     * Результат скачивания: разобранные кейсы и скачанные файлы.
+     *
+     * @param cases разобранные кейсы в порядке индекса
+     * @param files скачанные файлы для сохранения в БД
+     */
+    public record FetchResult(List<ParsedTestCase> cases, List<FetchedArtifact> files) {
+    }
 
     /**
      * REST-клиент для загрузки файлов.
@@ -38,11 +57,6 @@ public class TestCaseFetcher {
      * Парсер индекса и файлов кейсов.
      */
     private final TestCaseParser parser;
-
-    /**
-     * Настройки приложения; из них берутся каталог загрузок.
-     */
-    private final AppProperties appProps;
 
     /**
      * Разрешённые хосты в нижнем регистре; заполняется из {@code app.download.allowed-hosts}.
@@ -61,6 +75,11 @@ public class TestCaseFetcher {
      * Максимальный номер версии, который проверяется при переборе {@code X_N.ext}.
      */
     private static final int MAX_VERSION_PROBE = 50;
+
+    /**
+     * Максимальное число переходов по редиректам при скачивании одного файла.
+     */
+    private static final int MAX_REDIRECTS = 5;
 
     /**
      * Результат скачивания: фактическое имя файла (с суффиксом версии) и содержимое.
@@ -87,64 +106,85 @@ public class TestCaseFetcher {
                            AppProperties appProps) {
         this.http = fileFetchRestClient;
         this.parser = parser;
-        this.appProps = appProps;
         var cfg = appProps.getDownload().getAllowedHosts();
-        this.allowedHosts = (cfg == null || cfg.isEmpty())
-                ? Set.of("localhost")
-                : cfg.stream().map(s -> s.toLowerCase().trim()).collect(Collectors.toUnmodifiableSet());
+        Set<String> hosts = cfg == null ? Set.of() : cfg.stream()
+                .filter(s -> s != null && !s.isBlank())
+                .map(s -> s.trim().toLowerCase(Locale.ROOT))
+                .collect(Collectors.toUnmodifiableSet());
+        this.allowedHosts = hosts.isEmpty() ? Set.of("localhost") : hosts;
         log.info("TestCaseFetcher: allowedHosts = {}", allowedHosts);
     }
 
     /**
-     * Скачивает и разбирает все тест-кейсы по исходному URL.
+     * Скачивает и разбирает все тест-кейсы по исходному URL. Удобная обёртка над {@link #fetch(String)}.
+     *
+     * @param sourceUrl URL каталога или файла; не должен быть пустым
+     * @return список разобранных кейсов в порядке индекса
+     * @throws IllegalArgumentException см. {@link #fetch(String)}
+     * @throws FetchException           см. {@link #fetch(String)}
+     */
+    public List<ParsedTestCase> fetchAll(String sourceUrl) {
+        return fetch(sourceUrl).cases();
+    }
+
+    /**
+     * Скачивает и разбирает все тест-кейсы по исходному URL и собирает скачанные файлы.
      * <p>
      * Если URL оканчивается на {@code .md}, файл скачивается напрямую. Если это индекс,
      * его ссылки раскрываются, иначе файл разбирается как один кейс. Во всех остальных
      * случаях URL трактуется как каталог: из него скачивается {@code _index.md}. Если
-     * индекса нет (документ не является индексом), каталог даёт один кейс из этого файла.
+     * скачанный файл не является индексом (нет заголовка «# Тест-кейсы — индекс»), он
+     * разбирается как один кейс. Если {@code _index.md} не скачан, бросается {@link FetchException}.
+     * <p>
+     * Индекс попадает в файлы с видом {@code index}, кейсы — с видом {@code test_case}.
      *
      * @param sourceUrl URL каталога или файла; не должен быть пустым
-     * @return список разобранных кейсов в порядке индекса
+     * @return разобранные кейсы и скачанные файлы
      * @throws IllegalArgumentException {@code sourceUrl} пуст, либо одиночный файл, переданный
      *                                  напрямую, не удалось разобрать или URL запрещён
      * @throws FetchException           индекс не скачан, пуст, либо не скачан или не разобран
      *                                  хотя бы один файл из индекса (см. {@link #fetchFromIndex})
      */
-    public List<ParsedTestCase> fetchAll(String sourceUrl) {
+    public FetchResult fetch(String sourceUrl) {
         if (sourceUrl == null || sourceUrl.isBlank()) {
             throw new IllegalArgumentException("sourceUrl обязателен");
         }
         String trimmed = sourceUrl.trim();
+        List<FetchedArtifact> files = new ArrayList<>();
 
         if (trimmed.endsWith(".md")) {
             log.info("Скачиваем индекс напрямую: {}", trimmed);
-            String indexMd = getWithVersionFallback(trimmed).body();
+            DownloadedFile indexFile = getWithVersionFallback(trimmed);
+            String indexMd = indexFile.body();
             String baseDirUrl = trimmed.substring(0, trimmed.lastIndexOf('/') + 1);
             String indexFilename = trimmed.substring(trimmed.lastIndexOf('/') + 1);
             String prefix = extractPrefix(indexFilename);
             if (!parser.isIndexMarkdown(indexMd)) {
-                return List.of(parseSingle(trimmed, indexMd));
+                return new FetchResult(List.of(parseSingle(trimmed, indexMd, files)), files);
             }
-            return fetchFromIndex(indexMd, baseDirUrl, prefix);
+            files.add(new FetchedArtifact("index", indexFile.filename(), indexMd));
+            return new FetchResult(fetchFromIndex(indexMd, baseDirUrl, prefix, files), files);
         }
 
         String baseDirUrl = normalizeDirUrl(trimmed);
         String indexUrl = baseDirUrl + "_index.md";
-        String indexMd;
+        DownloadedFile indexFile;
         try {
-            indexMd = getWithVersionFallback(indexUrl).body();
+            indexFile = getWithVersionFallback(indexUrl);
         } catch (Exception e) {
             log.warn("Не удалось скачать _index.md ({}): {}", indexUrl, e.getMessage());
             throw new FetchException("Не удалось получить _index.md по " + indexUrl + ": " + e.getMessage(), e);
         }
+        String indexMd = indexFile.body();
         if (!parser.isIndexMarkdown(indexMd)) {
             try {
-                return List.of(parseSingle(indexUrl, indexMd));
+                return new FetchResult(List.of(parseSingle(indexUrl, indexMd, files)), files);
             } catch (Exception e) {
                 throw new FetchException("Не удалось разобрать " + indexUrl + ": " + e.getMessage(), e);
             }
         }
-        return fetchFromIndex(indexMd, baseDirUrl, "");
+        files.add(new FetchedArtifact("index", indexFile.filename(), indexMd));
+        return new FetchResult(fetchFromIndex(indexMd, baseDirUrl, "", files), files);
     }
 
     /**
@@ -171,17 +211,20 @@ public class TestCaseFetcher {
      * Для каждой ссылки проверяется безопасность имени ({@link TestCaseParser#toSafeFilename}).
      * Если задан {@code prefix} и имя его не содержит, префикс добавляется. Файл
      * загружается с перебором версий ({@link #getWithVersionFallback}), разбирается и
-     * сохраняется копией. Если хоть один файл не скачан или не разобран, бросается
-     * {@link FetchException} со списком проблем, и неполный набор не возвращается.
-     * Копии файлов, которые уже были скачаны, при этом остаются в каталоге загрузок.
+     * добавляется в {@code files} как артефакт {@code test_case}. Если хоть один файл не скачан
+     * или не разобран, бросается {@link FetchException} со списком проблем, и неполный набор
+     * не возвращается; вызывающий код при этом ничего не сохраняет.
      *
      * @param indexMd    текст индекса
      * @param baseDirUrl URL каталога, относительно которого заданы ссылки
      * @param prefix     префикс имён файлов или пустая строка
+     * @param files      накопитель скачанных файлов
      * @return все разобранные кейсы в порядке индекса
-     * @throws FetchException индекс пуст (нет ссылок) или хотя бы один файл не скачан или не разобран
+     * @throws FetchException индекс пуст (нет ссылок), хотя бы одна ссылка имеет небезопасное имя,
+     *                        или хотя бы один файл не скачан или не разобран
      */
-    private List<ParsedTestCase> fetchFromIndex(String indexMd, String baseDirUrl, String prefix) {
+    private List<ParsedTestCase> fetchFromIndex(String indexMd, String baseDirUrl, String prefix,
+                                                List<FetchedArtifact> files) {
         List<TestCaseParser.IndexEntry> entries = parser.parseIndex(indexMd);
         if (entries.isEmpty()) {
             throw new FetchException("_index.md не содержит ссылок на тест-кейсы: " + baseDirUrl);
@@ -202,7 +245,7 @@ public class TestCaseFetcher {
             try {
                 DownloadedFile file = getWithVersionFallback(fileUrl);
                 result.add(parser.parse(file.body(), file.filename()));
-                saveCopy(file.filename(), file.body());
+                files.add(new FetchedArtifact("test_case", file.filename(), file.body()));
             } catch (Exception ex) {
                 log.warn("Не удалось скачать или разобрать {}: {}", fileUrl, ex.getMessage());
                 problems.add(fileUrl + ": " + ex.getMessage());
@@ -219,20 +262,22 @@ public class TestCaseFetcher {
     }
 
     /**
-     * Разбирает один файл, переданный как самостоятельный кейс, и сохраняет его копию.
-     * Если имя файла из URL небезопасно, копия сохраняется как {@code testcase.md}.
+     * Разбирает один файл, переданный как самостоятельный кейс, и добавляет его в артефакты {@code test_case}.
+     * Если имя файла из URL небезопасно, артефакт получает имя {@code testcase.md}.
      *
-     * @param url URL файла, из которого берётся имя
-     * @param md  текст файла
+     * @param url   URL файла, из которого берётся имя
+     * @param md    текст файла
+     * @param files накопитель скачанных файлов
      * @return разобранный кейс
      * @throws IllegalArgumentException файл не удалось разобрать
      */
-    private ParsedTestCase parseSingle(String url, String md) {
+    private ParsedTestCase parseSingle(String url, String md, List<FetchedArtifact> files) {
         String name = fileName(url);
         String safe = parser.toSafeFilename(name);
         if (safe == null) safe = "testcase.md";
-        saveCopy(safe, md);
-        return parser.parse(md, safe);
+        ParsedTestCase tc = parser.parse(md, safe);
+        files.add(new FetchedArtifact("test_case", safe, md));
+        return tc;
     }
 
     /**
@@ -299,14 +344,50 @@ public class TestCaseFetcher {
      */
     private String get(String url) {
         URI uri = validate(url);
+        String body;
         try {
-            var body = http.get().uri(uri).retrieve().body(String.class);
-            if (body == null || body.isBlank()) throw new FetchException("Пустой ответ: " + url);
-            return body;
+            body = fetchFollowingRedirects(uri);
         } catch (FetchException e) {
             throw e;
         } catch (Exception e) {
             throw new FetchException("Ошибка скачивания " + url + ": " + e.getMessage(), e);
+        }
+        if (body == null || body.isBlank()) throw new FetchException("Пустой ответ: " + url);
+        return body;
+    }
+
+    /**
+     * Скачивает тело по URL, обрабатывая редиректы вручную.
+     * <p>
+     * Клиент не следует редиректам автоматически. Для ответа 3xx заголовок {@code Location}
+     * резолвится относительно текущего URL и проверяется через {@link #validate(String)}
+     * (схема http(s) и allowlist хоста). Переходов не больше {@link #MAX_REDIRECTS}.
+     *
+     * @param start URL, уже прошедший проверку
+     * @return тело конечного ответа; может быть {@code null} или пустым
+     * @throws FetchException редирект без Location, переход на запрещённый URL или хост,
+     *                        либо превышен лимит переходов
+     */
+    private String fetchFollowingRedirects(URI start) {
+        URI current = start;
+        for (int hop = 0; ; hop++) {
+            ResponseEntity<String> resp = http.get().uri(current).retrieve().toEntity(String.class);
+            if (!resp.getStatusCode().is3xxRedirection()) {
+                return resp.getBody();
+            }
+            if (hop >= MAX_REDIRECTS) {
+                throw new FetchException("Превышено число редиректов (" + MAX_REDIRECTS + "): " + start);
+            }
+            URI location = resp.getHeaders().getLocation();
+            if (location == null) {
+                throw new FetchException("Редирект без заголовка Location: " + current);
+            }
+            URI target = current.resolve(location);
+            try {
+                current = validate(target.toString());
+            } catch (IllegalArgumentException e) {
+                throw new FetchException("Редирект запрещён (" + current + " → " + target + "): " + e.getMessage(), e);
+            }
         }
     }
 
@@ -330,7 +411,7 @@ public class TestCaseFetcher {
             throw new IllegalArgumentException("URL должен быть http(s): " + raw);
         }
         String host = uri.getHost();
-        if (host == null || !allowedHosts.contains(host.toLowerCase())) {
+        if (host == null || !allowedHosts.contains(host.toLowerCase(Locale.ROOT))) {
             throw new IllegalArgumentException("Хост не разрешён: " + host + ". Разрешены: " + allowedHosts);
         }
         return uri;
@@ -360,22 +441,5 @@ public class TestCaseFetcher {
             return slash >= 0 ? trimmed.substring(0, slash + 1) : trimmed;
         }
         return trimmed.endsWith("/") ? trimmed : trimmed + "/";
-    }
-
-    /**
-     * Сохраняет копию скачанного файла в каталог загрузок {@code app.download.directory}.
-     * Ошибка записи логируется и не прерывает прогон.
-     *
-     * @param filename имя файла в каталоге загрузок
-     * @param content  содержимое файла
-     */
-    private void saveCopy(String filename, String content) {
-        try {
-            Path dir = appProps.getDownload().getDirectory();
-            Files.createDirectories(dir);
-            Files.writeString(dir.resolve(filename), content);
-        } catch (Exception e) {
-            log.warn("Не удалось сохранить копию {}: {}", filename, e.getMessage());
-        }
     }
 }

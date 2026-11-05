@@ -19,7 +19,7 @@ RUN java -cp "/app/deps/*" com.microsoft.playwright.CLI install --with-deps chro
  && rm -rf /var/lib/apt/lists/* \
  && chmod -R a+rX /ms-playwright \
  && groupadd -r app && useradd -r -g app -d /app app \
- && mkdir -p /app/data && chown -R app:app /app
+ && chown -R app:app /app /ms-playwright
 COPY --from=build /src/target/*.jar /app/app.jar
 USER app
 EXPOSE 8083

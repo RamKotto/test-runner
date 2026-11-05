@@ -13,7 +13,7 @@ import java.util.List;
  * Сервисный фасад над {@link HybridCaseRunner}, который вызывает контроллер прогона.
  * <p>
  * Место в конвейере: {@code RunController} перебирает разобранные кейсы и для каждого
- * вызывает {@link #runCase}. Фасад отсекает кейсы без типа до запуска, а результат
+ * вызывает {@link #runCase}. Фасад отсекает кейсы без типа и с типом {@code INVALID} до запуска, а результат
  * {@link HybridCaseRunner.Result} переупаковывает в {@link RunnerOutcome}, добавив признак
  * пропуска кейса.
  */
@@ -74,8 +74,10 @@ public class TestCaseRunnerService {
      * Кейс с типом {@code null} или {@code INVALID} не запускается: возвращается
      * статус {@code SKIPPED} с признаком {@code skipCase = true}. Тип, который не входит
      * в {@code UI}, {@code API}, {@code E2E}, {@code NEGATIVE} и {@code SECURITY},
-     * приводит к предупреждению в логе, но кейс всё равно выполняется. Правила допустимых
-     * операций для такого типа задаёт {@link HybridCaseRunner}.
+     * приводит к предупреждению в логе, но кейс всё равно выполняется. Текст предупреждения
+     * говорит «трактую как UI», однако {@link HybridCaseRunner} для неизвестного типа
+     * допускает операции обеих групп (UI и API). Правила допустимых операций задаёт
+     * {@link HybridCaseRunner}.
      *
      * @param tc         разобранный тест-кейс
      * @param startUrl   стартовый URL для UI-шагов; может быть {@code null}

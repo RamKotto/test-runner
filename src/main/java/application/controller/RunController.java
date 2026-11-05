@@ -1,26 +1,56 @@
 package application.controller;
 
-import application.dto.Dtos.*;
+import application.dto.Dtos.AnswerRequest;
+import application.dto.Dtos.AnswerRequest.Answer;
+import application.dto.Dtos.Clarification;
+import application.dto.Dtos.DraftRequest;
+import application.dto.Dtos.ExecutionOutcome;
+import application.dto.Dtos.ParsedTestCase;
+import application.dto.Dtos.RunRequest;
+import application.dto.Dtos.RunResponse;
+import application.dto.Dtos.RunSessionView;
+import application.dto.Dtos.RunState;
 import application.exception.AssertionFailure;
-import application.repository.RunRepository;
-import application.service.*;
+import application.exception.ConflictException;
+import application.exception.FetchException;
+import application.repository.ArtifactRepository;
+import application.repository.ArtifactRepository.NewArtifact;
+import application.repository.ArtifactRepository.StoredArtifact;
+import application.repository.ClarificationSessionRepository.SessionRow;
+import application.service.EnrichedStorageService;
+import application.service.RunSessionService;
+import application.service.TestCaseFetcher;
+import application.service.TestCaseFetcher.FetchResult;
+import application.service.TestCaseFetcher.FetchedArtifact;
+import application.service.TestCaseMarkdownRenderer;
+import application.service.TestCaseParser;
+import application.service.TestCaseRunnerService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.ResponseStatus;
+import org.springframework.web.bind.annotation.RestController;
 
-import java.time.Instant;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 /**
- * REST-контроллер исполнения тест-кейсов: {@code POST /api/run} и {@code POST /api/run/{taskId}/answers}.
+ * REST-контроллер исполнения тест-кейсов: запуск, ответы на уточнения, состояние сессии и черновики.
  * <p>
- * Контроллер оркестрирует прогон: скачивает кейсы ({@link TestCaseFetcher}), исполняет их по порядку
- * ({@link TestCaseRunnerService}), записывает обогащённые файлы и индекс ({@link EnrichedStorageService},
- * {@link TestCaseMarkdownRenderer}), хранит состояние остановленного прогона ({@link SessionStore}) и
- * записывает результат в БД ({@link RunRepository}).
+ * Эндпоинты: {@code POST /api/run}, {@code POST /api/run/{taskId}/answers}, {@code GET /api/run/{taskId}},
+ * {@code PUT /api/run/{taskId}/draft}. Источник кейсов: {@code sourceRunId} (артефакты md-to-test в БД) или
+ * {@code sourceUrl} (HTTP). Состояние сессии, ответы и файлы сохраняются в БД; в памяти процесса ничего не хранится.
  */
 @Slf4j
 @RestController
@@ -28,115 +58,145 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class RunController {
 
+    /**
+     * Текст сообщения при запуске без источника или с двумя источниками.
+     */
+    private static final String ONE_SOURCE_REQUIRED = "Укажите ровно одно из полей: sourceRunId или sourceUrl";
+
     private final TestCaseFetcher fetcher;
+    private final TestCaseParser parser;
     private final TestCaseRunnerService runner;
     private final TestCaseMarkdownRenderer renderer;
-    private final EnrichedStorageService storage;
-    private final SessionStore sessions;
-    private final RunRepository runRepository;
+    private final ArtifactRepository artifacts;
+    private final EnrichedStorageService enriched;
+    private final RunSessionService sessions;
 
     /**
-     * Запускает прогон: скачивает тест-кейсы по {@code sourceUrl}, исполняет их по порядку и возвращает результат.
+     * Запускает прогон и возвращает результат. Источник — ровно один из {@code sourceRunId} и {@code sourceUrl}.
      * <p>
-     * Если прогон остановлен уточнением, его состояние сохраняется в {@link SessionStore} под новым taskId,
-     * а статус ответа — {@code NEEDS_CLARIFICATION}. Результат всегда записывается в БД.
+     * При {@code sourceRunId} индекс (артефакт {@code index} с этим run_id) задаёт порядок, а кейсы
+     * ({@code test_case}) берутся по именам из индекса. Если индекса или кейса нет, либо он не разобран,
+     * прогон не запускается ({@link FetchException}). При {@code sourceUrl} скачанные файлы сохраняются
+     * артефактами {@code test_case} с run_id нового прогона.
      *
-     * @param request тело запроса; поле {@code sourceUrl} обязательно
+     * @param request тело запроса
      * @return ответ 200 с {@link RunResponse}
-     * @throws IllegalArgumentException если {@code sourceUrl} пуст или прямая ссылка на {@code .md} указывает
-     *                                  на недопустимый хост или некорректный URL (HTTP 400)
-     * @throws application.exception.FetchException если тест-кейсы не удалось получить или разобрать,
-     *                                              в том числе для каталога и {@code _index.md} (HTTP 502)
-     * @throws application.exception.StorageException при ошибке записи обогащённых файлов (HTTP 500)
+     * @throws IllegalArgumentException заданы оба источника или ни одного, либо идентификатор некорректен (HTTP 400)
+     * @throws FetchException           кейсы не удалось получить или разобрать (HTTP 502)
+     * @throws ConflictException        не используется при создании прогона (HTTP 409 — только при ответах)
      */
     @PostMapping
     public ResponseEntity<RunResponse> run(@RequestBody RunRequest request) {
-        if (!request.hasSourceUrl()) {
-            throw new IllegalArgumentException("sourceUrl обязателен");
+        if (request.hasSourceRunId() == request.hasSourceUrl()) {
+            throw new IllegalArgumentException(ONE_SOURCE_REQUIRED);
         }
-        String taskId = UUID.randomUUID().toString();
-        List<ParsedTestCase> testCases = fetcher.fetchAll(request.sourceUrl());
+        UUID taskId = UUID.randomUUID();
+        List<ParsedTestCase> testCases;
+        List<NewArtifact> fetchedFiles = new ArrayList<>();
+        String sourceRunId = null;
+        String sourceUrl = null;
+        if (request.hasSourceRunId()) {
+            UUID source = EnrichedStorageService.parseUuid(request.sourceRunId(), "Некорректный sourceRunId");
+            sourceRunId = source.toString();
+            testCases = loadCasesFromRun(source);
+        } else {
+            sourceUrl = request.sourceUrl();
+            FetchResult fetched = fetcher.fetch(sourceUrl);
+            testCases = fetched.cases();
+            for (FetchedArtifact f : fetched.files()) {
+                fetchedFiles.add(NewArtifact.of(f.kind(), f.filename(), EnrichedStorageService.TEXT_MARKDOWN,
+                        f.content().getBytes(StandardCharsets.UTF_8)));
+            }
+        }
 
+        RunState base = new RunState(testCases, 0, sourceRunId, sourceUrl,
+                request.startUrl(), request.apiBaseUrl(), List.of(), null);
         RunExecution exec = executeAll(testCases, request.startUrl(), request.apiBaseUrl(), List.of());
-
-        if (exec.stopped()) {
-            sessions.put(taskId, new SessionStore.Session(
-                    testCases, request.sourceUrl(), request.startUrl(), request.apiBaseUrl(),
-                    exec.stoppedAtCaseIndex(), Instant.now(), List.of(),
-                    exec.completedBeforeStop()));
-        }
-        return respond(taskId, request.sourceUrl(), request.startUrl(), request.apiBaseUrl(),
-                exec.outcomes(), exec.clarifications());
+        return complete(taskId, base, exec, new Persist(true, 0, 1, 0, List.of()), fetchedFiles);
     }
 
     /**
      * Принимает ответы пользователя на уточнения и продолжает прогон с кейса, на котором он остановился.
      * <p>
-     * Кейс, на котором остановились, перезапускается целиком с шага 0, и ему передаются все накопленные ответы.
-     * Кейсы, завершённые до остановки, не перезапускаются: их результаты переносятся в ответ. Осознанное
-     * следствие: API-вызовы {@code POST}, {@code PUT} и {@code DELETE} этого кейса выполняются повторно.
-     * Если прогон снова остановлен, состояние сохраняется под тем же taskId, иначе сессия удаляется.
+     * Непустые ответы получают раунд {@code round + 1}. В выполнение передаётся полный набор ответов сессии
+     * с дедупликацией по теме и вопросу (побеждает последний). Кейс, на котором остановились, перезапускается
+     * целиком; завершённые до остановки кейсы не перезапускаются.
      * <p>
-     * Ответ содержит полный набор итогов прогона, а не только новые.
+     * Если {@code expectedVersion} передан и не совпадает с текущей версией, либо версия изменилась параллельно,
+     * возвращается 409. При успехе версия и раунд увеличиваются на 1.
      *
      * @param taskId  идентификатор прогона из предыдущего ответа
-     * @param request ответы пользователя; {@code answers} может быть {@code null}
-     * @return ответ 200 с {@link RunResponse}
-     * @throws IllegalArgumentException если сессия с таким taskId не найдена или истекла (HTTP 400)
+     * @param request ответы и необязательная ожидаемая версия
+     * @return ответ 200 с {@link RunResponse}, включая новую версию
+     * @throws IllegalArgumentException сессии нет или она истекла; прогон уже завершён (HTTP 400)
+     * @throws ConflictException        версия сессии не совпадает (HTTP 409)
      */
     @PostMapping("/{taskId}/answers")
-    public ResponseEntity<RunResponse> answer(@PathVariable String taskId,
-                                              @RequestBody AnswerRequest request) {
-        SessionStore.Session session = sessions.get(taskId);
-        if (session == null) {
-            throw new IllegalArgumentException("Сессия не найдена или истекла");
+    public ResponseEntity<RunResponse> answer(@PathVariable String taskId, @RequestBody AnswerRequest request) {
+        UUID id = parseTaskId(taskId);
+        SessionRow session = sessions.requireActive(id);
+        if (request.expectedVersion() != null && request.expectedVersion() != session.version()) {
+            throw new ConflictException(RunSessionService.CONFLICT_MESSAGE);
         }
-        log.info("Ответы на уточнения для taskId={}: {}", taskId,
-                request.answers() == null ? 0 : request.answers().size());
-
-        List<AnswerRequest.Answer> allAnswers = new ArrayList<>(
-                session.answers() == null ? List.of() : session.answers());
-        if (request.answers() != null) {
-            allAnswers.addAll(request.answers());
+        if ("DONE".equals(session.status())) {
+            throw new IllegalArgumentException("Прогон уже завершён, уточнения не требуются");
         }
+        RunState state = sessions.readState(session.stateJson());
+        List<Answer> fresh = RunSessionService.nonEmpty(request.answers());
+        log.info("Ответы на уточнения для taskId={}: непустых {}", id, fresh.size());
 
-        List<ParsedTestCase> remaining = session.testCases()
-                .subList(session.currentTestCaseIndex(), session.testCases().size());
-        RunExecution exec = executeAll(remaining, session.startUrl(), session.apiBaseUrl(), allAnswers);
-
-        List<ExecutionOutcome> allOutcomes = concat(session.completedOutcomes(), exec.outcomes());
-
-        if (exec.stopped()) {
-            sessions.put(taskId, new SessionStore.Session(
-                    session.testCases(), session.sourceUrl(), session.startUrl(), session.apiBaseUrl(),
-                    session.currentTestCaseIndex() + exec.stoppedAtCaseIndex(),
-                    Instant.now(), allAnswers,
-                    concat(session.completedOutcomes(), exec.completedBeforeStop())));
-        } else {
-            sessions.remove(taskId);
-        }
-        return respond(taskId, session.sourceUrl(), session.startUrl(), session.apiBaseUrl(),
-                allOutcomes, exec.clarifications());
+        List<Answer> all = RunSessionService.dedupe(concat(sessions.historyAnswers(id), fresh));
+        List<ParsedTestCase> remaining = state.testCases()
+                .subList(state.currentTestCaseIndex(), state.testCases().size());
+        RunExecution exec = executeAll(remaining, state.startUrl(), state.apiBaseUrl(), all);
+        return complete(id, state, exec,
+                new Persist(false, session.version(), session.version() + 1, session.round() + 1, fresh),
+                List.of());
     }
 
     /**
-     * Итог выполнения последовательности кейсов.
-     * <p>
-     * Элемент {@code outcomes[i]} соответствует кейсу {@code cases[i]} переданного списка. Поскольку
-     * выполнение останавливается на кейсе с уточнением, {@code outcomes} содержит только кейсы до него включительно.
+     * Возвращает состояние сессии прогона: статус, версию, раунд, уточнения, историю ответов, черновики
+     * и поля последнего ответа.
      *
-     * @param outcomes             итоги выполненных кейсов
-     * @param clarifications       уточнения, собранные на момент остановки
-     * @param stoppedAtCaseIndex   индекс кейса в переданном списке, на котором остановились; {@code -1}, если остановки не было
+     * @param taskId идентификатор прогона
+     * @return состояние сессии
+     * @throws IllegalArgumentException сессии нет или она истекла (HTTP 400)
+     */
+    @GetMapping("/{taskId}")
+    public RunSessionView get(@PathVariable String taskId) {
+        return sessions.view(sessions.requireActive(parseTaskId(taskId)));
+    }
+
+    /**
+     * Перезаписывает черновики ответов целиком. Версия сессии не меняется.
+     *
+     * @param taskId  идентификатор прогона
+     * @param request черновики по индексу уточнения
+     * @throws IllegalArgumentException сессии нет или она истекла (HTTP 400)
+     */
+    @PutMapping("/{taskId}/draft")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void draft(@PathVariable String taskId, @RequestBody DraftRequest request) {
+        sessions.updateDraft(parseTaskId(taskId), request == null ? null : request.draft());
+    }
+
+    /**
+     * Результат выполнения последовательности кейсов.
+     *
+     * @param outcomes           итоги кейсов до остановки включительно
+     * @param clarifications     уточнения, собранные на момент остановки
+     * @param stoppedAtCaseIndex индекс кейса в переданном списке, на котором остановились; {@code -1}, если остановки не было
+     * @param files              обогащённые файлы кейсов, записанные в этом выполнении
      */
     private record RunExecution(List<ExecutionOutcome> outcomes,
                                 List<Clarification> clarifications,
-                                int stoppedAtCaseIndex) {
+                                int stoppedAtCaseIndex,
+                                List<NewArtifact> files) {
 
         /**
          * Проверяет, была ли остановка на уточнении.
          *
-         * @return {@code true}, если {@code stoppedAtCaseIndex} не отрицательный
+         * @return {@code true}, если остановка была
          */
         boolean stopped() {
             return stoppedAtCaseIndex >= 0;
@@ -145,7 +205,7 @@ public class RunController {
         /**
          * Возвращает итоги кейсов, полностью завершённых до кейса с уточнением.
          *
-         * @return подсписок {@code outcomes} без последнего элемента, соответствующего остановленному кейсу
+         * @return подсписок итогов без остановленного кейса
          */
         List<ExecutionOutcome> completedBeforeStop() {
             return outcomes.subList(0, stoppedAtCaseIndex);
@@ -153,33 +213,87 @@ public class RunController {
     }
 
     /**
+     * Параметры версии и истории ответов для фиксации запроса.
+     *
+     * @param create          {@code true} при первом запуске прогона
+     * @param expectedVersion версия, которую читал запрос
+     * @param version         новая версия
+     * @param round           раунд, которым записываются новые ответы
+     * @param newAnswers      новые непустые ответы
+     */
+    private record Persist(boolean create, int expectedVersion, int version, int round, List<Answer> newAnswers) {
+    }
+
+    /**
+     * Загружает кейсы прогона-источника из БД: порядок задаёт индекс, содержимое берётся по именам файлов.
+     *
+     * @param sourceRunId taskId генерации (md-to-test)
+     * @return кейсы в порядке индекса
+     * @throws FetchException индекс не найден, пуст, либо какой-то файл отсутствует или не разобран
+     */
+    private List<ParsedTestCase> loadCasesFromRun(UUID sourceRunId) {
+        List<StoredArtifact> indexes = artifacts.findRunFiles(sourceRunId, "index");
+        if (indexes.isEmpty()) {
+            throw new FetchException("Индекс тест-кейсов не найден для sourceRunId=" + sourceRunId
+                    + ". Прогон не запущен.");
+        }
+        List<TestCaseParser.IndexEntry> entries = parser.parseIndex(indexes.get(0).contentAsText());
+        if (entries.isEmpty()) {
+            throw new FetchException("Индекс не содержит ссылок на тест-кейсы: sourceRunId=" + sourceRunId);
+        }
+        Map<String, StoredArtifact> casesByName = new HashMap<>();
+        for (StoredArtifact a : artifacts.findRunFiles(sourceRunId, "test_case")) {
+            casesByName.putIfAbsent(a.filename(), a);
+        }
+        List<ParsedTestCase> result = new ArrayList<>();
+        List<String> problems = new ArrayList<>();
+        for (TestCaseParser.IndexEntry entry : entries) {
+            String name = parser.toSafeFilename(entry.relativePath());
+            if (name == null) {
+                problems.add("некорректное имя файла в индексе: `" + entry.relativePath() + "`");
+                continue;
+            }
+            StoredArtifact file = casesByName.get(name);
+            if (file == null) {
+                problems.add(name + ": файл не найден в артефактах прогона");
+                continue;
+            }
+            try {
+                result.add(parser.parse(file.contentAsText(), name));
+            } catch (IllegalArgumentException e) {
+                problems.add(name + ": " + e.getMessage());
+            }
+        }
+        if (!problems.isEmpty()) {
+            throw new FetchException("Не удалось загрузить " + problems.size() + " из " + entries.size()
+                    + " тест-кейсов (sourceRunId=" + sourceRunId + "). Прогон не запущен:\n - "
+                    + String.join("\n - ", problems));
+        }
+        return result;
+    }
+
+    /**
      * Выполняет кейсы по порядку до первого кейса, который требует уточнения.
      * <p>
-     * Каждый кейс выполняется через {@link TestCaseRunnerService} с полным списком накопленных ответов;
-     * обогащённый файл кейса записывается под его исходным именем. Ошибка {@link AssertionFailure}
-     * (например, стартовый URL вне {@code app.target.allowed-hosts}) переводит кейс в {@code FAILED},
-     * а прогон продолжается. Статусы {@code SKIPPED} и {@code FAILED} прогон не прерывают. Остальные
-     * исключения из выполнения кейса прерывают весь запрос.
-     * <p>
-     * Осознанное ограничение: кейс, на котором остановились, при ответе перезапускается целиком, поэтому его
-     * API-вызовы с побочными эффектами (POST, PUT, DELETE) выполняются повторно. Кейсы, завершённые до
-     * уточнения, не перезапускаются. Обогащённый файл такого кейса перезаписывается полной историей
-     * перезапущенного кейса.
+     * Каждый кейс выполняется через {@link TestCaseRunnerService} с переданными ответами. Обогащённый файл
+     * кейса собирается в {@code files}; запись в БД выполняется при фиксации. Ошибка {@link AssertionFailure}
+     * (например, стартовый URL вне allowlist) переводит кейс в {@code FAILED}, прогон продолжается. Остальные
+     * исключения прерывают запрос.
      *
      * @param cases     кейсы для выполнения по порядку
      * @param startUrl  стартовый URL веб-приложения; может быть {@code null}
      * @param apiBaseUrl базовый URL API; может быть {@code null}
-     * @param answers   накопленные ответы пользователя, передаваемые каждому кейсу
-     * @return итоги выполненных кейсов и индекс остановки
+     * @param answers   полный набор ответов, передаваемый каждому кейсу
+     * @return итоги, уточнения, индекс остановки и файлы
      */
     private RunExecution executeAll(List<ParsedTestCase> cases, String startUrl, String apiBaseUrl,
-                                    List<AnswerRequest.Answer> answers) {
+                                    List<Answer> answers) {
         List<ExecutionOutcome> outcomes = new ArrayList<>();
         List<Clarification> clarifications = new ArrayList<>();
+        List<NewArtifact> files = new ArrayList<>();
 
         for (int i = 0; i < cases.size(); i++) {
             ParsedTestCase tc = cases.get(i);
-
             ParsedTestCase tcWithAnswers = new ParsedTestCase(
                     tc.id(), tc.type(), tc.title(), tc.requirementRef(),
                     tc.preconditions(), tc.steps(), tc.expectedResult(),
@@ -199,57 +313,80 @@ public class RunController {
                         e.getMessage(), List.of());
             }
 
-            String enriched = renderer.renderEnriched(tc, outcome.enrichments());
-            storage.save(tc.sourceFilename(), enriched);
-
+            String enrichedMd = renderer.renderEnriched(tc, outcome.enrichments());
+            files.add(NewArtifact.of(EnrichedStorageService.KIND_CASE, tc.sourceFilename(),
+                    EnrichedStorageService.TEXT_MARKDOWN, enrichedMd.getBytes(StandardCharsets.UTF_8)));
             outcomes.add(outcome);
 
             if ("NEEDS_CLARIFICATION".equals(outcome.status())) {
                 clarifications.addAll(caseClarifications);
-                return new RunExecution(outcomes, clarifications, i);
+                return new RunExecution(outcomes, clarifications, i, files);
             }
         }
-        return new RunExecution(outcomes, clarifications, -1);
+        return new RunExecution(outcomes, clarifications, -1, files);
     }
 
     /**
-     * Формирует ответ прогона, сохраняет индексный файл и записывает прогон в БД.
+     * Формирует индекс, собирает состояние и фиксирует запрос в БД одной транзакцией.
      * <p>
-     * Статус {@code DONE}, если уточнений нет, иначе {@code NEEDS_CLARIFICATION}. Ошибка записи в БД
-     * не перехватывается: запрос завершится с HTTP 500.
+     * Статус {@code DONE}, если уточнений нет, иначе {@code NEEDS_CLARIFICATION}. Ссылки на индекс и архив
+     * вычисляются до фиксации, поскольку UUID артефакта задан заранее.
      *
-     * @param taskId         идентификатор прогона
-     * @param sourceUrl      URL источника тест-кейсов
-     * @param startUrl       стартовый URL веб-приложения; может быть {@code null}
-     * @param apiBaseUrl     базовый URL API; может быть {@code null}
-     * @param outcomes       итоги кейсов
-     * @param clarifications уточнения прогона
+     * @param taskId     идентификатор прогона
+     * @param base       состояние до запроса
+     * @param exec       результат выполнения кейсов в этом запросе
+     * @param persist    параметры версии и ответов
+     * @param extraFiles дополнительные файлы (скачанные кейсы и индекс источника), если есть
      * @return ответ 200 с {@link RunResponse}
+     * @throws ConflictException версия сессии изменена параллельным запросом (HTTP 409)
      */
-    private ResponseEntity<RunResponse> respond(String taskId, String sourceUrl, String startUrl,
-                                                String apiBaseUrl, List<ExecutionOutcome> outcomes,
-                                                List<Clarification> clarifications) {
-        String status = clarifications.isEmpty() ? "DONE" : "NEEDS_CLARIFICATION";
-        String indexUrl = saveIndexAndReturnUrl(outcomes, taskId);
-        runRepository.replaceRun(UUID.fromString(taskId), status, sourceUrl, startUrl, apiBaseUrl,
-                outcomes, clarifications);
-        return ResponseEntity.ok(new RunResponse(taskId, status, outcomes, clarifications, indexUrl));
+    private ResponseEntity<RunResponse> complete(UUID taskId, RunState base, RunExecution exec,
+                                                 Persist persist, List<NewArtifact> extraFiles) {
+        List<ExecutionOutcome> allOutcomes = concat(base.completedOutcomes(), exec.outcomes());
+        int nextIndex;
+        List<ExecutionOutcome> completed;
+        if (exec.stopped()) {
+            nextIndex = base.currentTestCaseIndex() + exec.stoppedAtCaseIndex();
+            completed = concat(base.completedOutcomes(), exec.completedBeforeStop());
+        } else {
+            nextIndex = base.testCases().size();
+            completed = allOutcomes;
+        }
+        String status = exec.clarifications().isEmpty() ? "DONE" : "NEEDS_CLARIFICATION";
+
+        NewArtifact index = NewArtifact.of(EnrichedStorageService.KIND_INDEX,
+                "_enriched_index_" + taskId + ".md", EnrichedStorageService.TEXT_MARKDOWN,
+                renderer.renderIndex(allOutcomes).getBytes(StandardCharsets.UTF_8));
+        RunResponse response = new RunResponse(
+                taskId.toString(),
+                status,
+                persist.version(),
+                allOutcomes,
+                exec.clarifications(),
+                enriched.fileUrl(index.id()),
+                enriched.archiveUrl(taskId));
+
+        RunState state = new RunState(base.testCases(), nextIndex, base.sourceRunId(), base.sourceUrl(),
+                base.startUrl(), base.apiBaseUrl(), completed, response);
+
+        List<NewArtifact> files = new ArrayList<>(extraFiles);
+        files.addAll(exec.files());
+        files.add(index);
+        sessions.commit(new RunSessionService.Commit(taskId, persist.create(), persist.expectedVersion(),
+                persist.version(), persist.round(), status, state, exec.clarifications(),
+                persist.newAnswers(), files, allOutcomes));
+        return ResponseEntity.ok(response);
     }
 
     /**
-     * Записывает индекс обогащённых кейсов прогона и возвращает его download-ссылку.
-     * <p>
-     * Имя файла {@code _enriched_index_<taskId>.md} уникально для прогона, поэтому параллельные прогоны
-     * не перезаписывают индексы друг друга.
+     * Разбирает идентификатор сессии. Некорректный UUID считается отсутствующей сессией.
      *
-     * @param outcomes итоги кейсов, для которых строится индекс
-     * @param taskId   идентификатор прогона
-     * @return URL сохранённого индекса
+     * @param taskId строка из пути
+     * @return UUID прогона
+     * @throws IllegalArgumentException строка не является UUID (HTTP 400)
      */
-    private String saveIndexAndReturnUrl(List<ExecutionOutcome> outcomes, String taskId) {
-        String indexMd = renderer.renderIndex(outcomes);
-        var saved = storage.save("_enriched_index_" + taskId + ".md", indexMd);
-        return saved.downloadUrl();
+    private static UUID parseTaskId(String taskId) {
+        return EnrichedStorageService.parseUuid(taskId, RunSessionService.SESSION_NOT_FOUND);
     }
 
     /**
@@ -258,7 +395,7 @@ public class RunController {
      * @param first  первый список; может быть {@code null}
      * @param second второй список; может быть {@code null}
      * @param <T>    тип элементов
-     * @return новый список, содержащий элементы {@code first}, затем {@code second}
+     * @return новый список
      */
     private static <T> List<T> concat(List<T> first, List<T> second) {
         List<T> result = new ArrayList<>();

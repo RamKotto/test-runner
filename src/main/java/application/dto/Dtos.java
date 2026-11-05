@@ -1,6 +1,8 @@
 package application.dto;
 
+import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Контейнер DTO-записей (record) для HTTP-API и обмена между контроллером и сервисами.
@@ -10,18 +12,28 @@ import java.util.List;
 public class Dtos {
 
     /**
-     * Тело запроса {@code POST /api/run}.
+     * Тело запроса {@code POST /api/run}. Нужно ровно одно из полей {@code sourceRunId} и {@code sourceUrl}.
      *
-     * @param sourceUrl  URL Markdown-источника: файл {@code *.md} или каталог с {@code _index.md}
-     * @param startUrl   стартовый URL веб-приложения для UI-шагов; может быть не задан
-     * @param apiBaseUrl базовый URL API для шагов, использующих относительный путь
+     * @param sourceRunId taskId генерации (md-to-test): кейсы читаются из артефактов БД
+     * @param sourceUrl   URL Markdown-источника: файл {@code *.md} или каталог с {@code _index.md}
+     * @param startUrl    стартовый URL веб-приложения для UI-шагов; может быть не задан
+     * @param apiBaseUrl  базовый URL API для шагов, использующих относительный путь
      */
-    public record RunRequest(String sourceUrl, String startUrl, String apiBaseUrl) {
+    public record RunRequest(String sourceRunId, String sourceUrl, String startUrl, String apiBaseUrl) {
+
+        /**
+         * Проверяет, что {@code sourceRunId} задан и содержит не только пробелы.
+         *
+         * @return {@code true}, если поле задано
+         */
+        public boolean hasSourceRunId() {
+            return sourceRunId != null && !sourceRunId.isBlank();
+        }
 
         /**
          * Проверяет, что {@code sourceUrl} задан и содержит не только пробелы.
          *
-         * @return {@code true}, если sourceUrl не null и не пуст после удаления пробелов по краям
+         * @return {@code true}, если поле задано
          */
         public boolean hasSourceUrl() {
             return sourceUrl != null && !sourceUrl.isBlank();
@@ -31,9 +43,11 @@ public class Dtos {
     /**
      * Тело запроса {@code POST /api/run/{taskId}/answers}.
      *
-     * @param answers ответы пользователя на уточнения; может быть {@code null}
+     * @param answers         ответы пользователя на уточнения; может быть {@code null}
+     * @param expectedVersion версия сессии, которую видел пользователь; необязательна. Если задана
+     *                        и не совпадает с текущей версией, сервис отвечает 409
      */
-    public record AnswerRequest(List<Answer> answers) {
+    public record AnswerRequest(List<Answer> answers, Integer expectedVersion) {
 
         /**
          * Ответ пользователя на одно уточнение.
@@ -42,13 +56,22 @@ public class Dtos {
          * шаг пропускается, даже когда ответ отличен от {@code SKIP}. Значение {@code SKIP}
          * (без учёта регистра) пропускает шаг по той же теме.
          *
-         * @param question текст уточнения, на который дан ответ
-         * @param answer   текст ответа
-         * @param topicKey ключ темы из {@link Clarification#topicKey()}; если пуст, сопоставление идёт
-         *                 по вхождению ключа в {@code question}
+         * @param question   текст уточнения, на который дан ответ
+         * @param answer     текст ответа
+         * @param topicKey   ключ темы из {@link Clarification#topicKey()}; если пуст, сопоставление идёт
+         *                   по вхождению ключа в {@code question}
+         * @param testCaseId идентификатор тест-кейса, к которому относится ответ; может быть {@code null}
          */
-        public record Answer(String question, String answer, String topicKey) {
+        public record Answer(String question, String answer, String topicKey, String testCaseId) {
         }
+    }
+
+    /**
+     * Тело запроса {@code PUT /api/run/{taskId}/draft}.
+     *
+     * @param draft черновики ответов по индексу уточнения, например {@code {"0": "текст"}}
+     */
+    public record DraftRequest(Map<String, String> draft) {
     }
 
     /**
@@ -238,16 +261,88 @@ public class Dtos {
      *
      * @param taskId           идентификатор прогона (UUID), который передаётся в URL ответов на уточнения
      * @param status           статус прогона: {@code DONE} или {@code NEEDS_CLARIFICATION}
+     * @param version          версия сессии после этого ответа
      * @param outcomes         итоги всех кейсов прогона, включая кейсы до остановки
      * @param clarifications   уточнения, на которые нужно ответить; пусто при {@code DONE}
-     * @param enrichedIndexUrl URL файла индекса обогащённых кейсов прогона
+     * @param enrichedIndexUrl ссылка на индекс обогащённых кейсов прогона (скачивание по UUID артефакта)
+     * @param archiveUrl       ссылка на ZIP со всеми обогащёнными файлами прогона
      */
     public record RunResponse(
             String taskId,
             String status,
+            int version,
             List<ExecutionOutcome> outcomes,
             List<Clarification> clarifications,
-            String enrichedIndexUrl
+            String enrichedIndexUrl,
+            String archiveUrl
+    ) {
+    }
+
+    /**
+     * Ответ на ранее данный ответ пользователя, как он хранится в истории сессии.
+     *
+     * @param round      номер раунда ответов
+     * @param testCaseId идентификатор тест-кейса; может быть {@code null}
+     * @param question   текст уточнения
+     * @param topicKey   ключ темы; может быть {@code null}
+     * @param answer     текст ответа
+     * @param answeredAt время ответа
+     */
+    public record AnswerView(int round, String testCaseId, String question, String topicKey,
+                             String answer, Instant answeredAt) {
+    }
+
+    /**
+     * Ответ {@code GET /api/run/{taskId}}: состояние сессии плюс поля последнего ответа прогона.
+     *
+     * @param taskId           идентификатор прогона
+     * @param status           {@code DONE} или {@code NEEDS_CLARIFICATION}
+     * @param version          версия сессии
+     * @param round            номер последнего раунда ответов
+     * @param outcomes         итоги кейсов из последнего ответа
+     * @param clarifications   уточнения из последнего ответа
+     * @param answers          история ответов сессии
+     * @param draft            черновики ответов по индексу уточнения
+     * @param expiresAt        время истечения сессии
+     * @param enrichedIndexUrl ссылка на индекс обогащённых кейсов
+     * @param archiveUrl       ссылка на архив прогона
+     */
+    public record RunSessionView(
+            String taskId,
+            String status,
+            int version,
+            int round,
+            List<ExecutionOutcome> outcomes,
+            List<Clarification> clarifications,
+            List<AnswerView> answers,
+            Map<String, String> draft,
+            Instant expiresAt,
+            String enrichedIndexUrl,
+            String archiveUrl
+    ) {
+    }
+
+    /**
+     * Внутреннее состояние прогона, которое хранится в {@code qa.clarification_sessions.state} (JSON).
+     *
+     * @param testCases            все кейсы прогона в порядке выполнения
+     * @param currentTestCaseIndex индекс кейса, с которого продолжится выполнение
+     * @param sourceRunId          taskId генерации, если прогон создан по {@code sourceRunId}
+     * @param sourceUrl            URL источника, если прогон создан по {@code sourceUrl}
+     * @param startUrl             стартовый URL веб-приложения
+     * @param apiBaseUrl           базовый URL API
+     * @param completedOutcomes    итоги кейсов, завершённых до {@code currentTestCaseIndex}
+     * @param lastResponse         последний ответ сервиса по этому прогону
+     */
+    public record RunState(
+            List<ParsedTestCase> testCases,
+            int currentTestCaseIndex,
+            String sourceRunId,
+            String sourceUrl,
+            String startUrl,
+            String apiBaseUrl,
+            List<ExecutionOutcome> completedOutcomes,
+            RunResponse lastResponse
     ) {
     }
 

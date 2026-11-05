@@ -5,6 +5,8 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.web.client.RestClient;
 
+import java.io.IOException;
+import java.net.HttpURLConnection;
 import java.time.Duration;
 
 /**
@@ -43,17 +45,22 @@ public class HttpConfig {
     /**
      * Создаёт клиент для скачивания тест-кейсов без базового URL и без заголовков.
      * <p>
-     * Таймауты берутся из {@code app.download}. Клиент использует стандартную обработку редиректов
-     * {@link SimpleClientHttpRequestFactory}, которая для GET следует за редиректами. Поэтому проверка
-     * allowlist, выполняемая в {@link application.service.TestCaseFetcher}, относится только к
-     * исходному URL.
+     * Таймауты берутся из {@code app.download}. Автоматическое следование редиректам отключено
+     * ({@code setInstanceFollowRedirects(false)}): 3xx обрабатывает
+     * {@link application.service.TestCaseFetcher}, который проверяет каждый Location по allowlist.
      *
      * @param appProps настройки приложения, из которых читаются таймауты скачивания
      * @return {@link RestClient} для GET-запросов файлов тест-кейсов
      */
     @Bean
     public RestClient fileFetchRestClient(AppProperties appProps) {
-        var factory = new SimpleClientHttpRequestFactory();
+        var factory = new SimpleClientHttpRequestFactory() {
+            @Override
+            protected void prepareConnection(HttpURLConnection connection, String httpMethod) throws IOException {
+                super.prepareConnection(connection, httpMethod);
+                connection.setInstanceFollowRedirects(false);
+            }
+        };
         factory.setConnectTimeout(Duration.ofSeconds(appProps.getDownload().getConnectTimeoutSeconds()));
         factory.setReadTimeout(Duration.ofSeconds(appProps.getDownload().getReadTimeoutSeconds()));
         return RestClient.builder().requestFactory(factory).build();

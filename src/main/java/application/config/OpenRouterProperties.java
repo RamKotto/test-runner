@@ -26,8 +26,9 @@ public class OpenRouterProperties {
 
     /**
      * API-ключ, передаётся в заголовке {@code Authorization: Bearer}. В application.yml берётся из
-     * переменной окружения {@code OPENROUTER_API_KEY} и не имеет значения по умолчанию; без действующего
-     * ключа OpenRouter отклоняет запросы, и планирование шагов завершается ошибкой.
+     * переменной окружения {@code OPENROUTER_API_KEY} и не имеет значения по умолчанию: если она не задана, приложение не запустится
+     * (поле помечено {@code @NotBlank}). Неверный ключ OpenRouter отклоняет запросы, и планирование
+     * шагов завершается ошибкой.
      */
     @NotBlank
     private String apiKey;

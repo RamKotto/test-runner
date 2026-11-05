@@ -2,172 +2,157 @@ package application.service;
 
 import application.config.AppProperties;
 import application.exception.StorageException;
-import jakarta.annotation.PostConstruct;
+import application.repository.ArtifactRepository;
+import application.repository.ArtifactRepository.StoredArtifact;
 import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.core.io.Resource;
-import org.springframework.core.io.UrlResource;
 import org.springframework.stereotype.Service;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.net.MalformedURLException;
-import java.nio.file.AtomicMoveNotSupportedException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
-import java.util.Comparator;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
 import java.util.regex.Pattern;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 /**
- * Хранилище результатов прогона: обогащённых кейсов и индекса.
+ * Обогащённые файлы прогона в БД: ссылки на артефакты и ZIP-архив прогона.
  * <p>
- * Место в конвейере: {@code RunController} сохраняет Markdown-файлы через {@link #save},
- * {@code ResultFileController} отдаёт их через {@link #load}. Файлы лежат в каталоге
- * {@code app.storage.directory}; имя файла должно соответствовать {@link #SAFE_NAME},
- * поэтому путь к файлу не выходит за пределы каталога.
+ * Место в конвейере: {@code RunController} формирует файлы обогащённых кейсов и индекс и передаёт их в
+ * {@link RunSessionService#commit}, который записывает их через {@link ArtifactRepository} в одной транзакции с сессией;
+ * {@code FileController} отдаёт архив
+ * через {@link #buildRunArchive(UUID)}. Диск не используется.
  */
-@Slf4j
 @Service
 @RequiredArgsConstructor
 public class EnrichedStorageService {
 
     /**
-     * Безопасное имя файла результата: латинские буквы, цифры, «_» и «-», расширение {@code .md}.
+     * Вид артефакта: обогащённый тест-кейс.
      */
-    private static final Pattern SAFE_NAME = Pattern.compile("^[a-zA-Z0-9_\\-]+\\.md$");
+    public static final String KIND_CASE = "enriched_case";
 
     /**
-     * Настройки приложения: каталоги хранения, базовый URL для ссылок на файлы.
+     * Вид артефакта: индекс обогащённых кейсов прогона.
      */
+    public static final String KIND_INDEX = "enriched_index";
+
+    /**
+     * MIME-тип Markdown-файлов.
+     */
+    public static final String TEXT_MARKDOWN = "text/markdown; charset=UTF-8";
+
+    /**
+     * Канонический UUID: 8-4-4-4-12 шестнадцатеричных символов.
+     */
+    private static final Pattern UUID_PATTERN = Pattern.compile(
+            "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$");
+
+    /**
+     * Файл для архива: имя записи и содержимое.
+     *
+     * @param name    имя записи в архиве
+     * @param content байты файла
+     */
+    public record NamedBytes(String name, byte[] content) {
+    }
+
+    private final ArtifactRepository artifacts;
     private final AppProperties props;
 
     /**
-     * Создаёт каталоги хранения результатов и скачанных кейсов при старте приложения.
+     * Проверяет, что строка является UUID, и возвращает его.
      *
-     * @throws StorageException каталоги создать не удалось
+     * @param value        проверяемая строка; может быть {@code null}
+     * @param errorMessage сообщение об ошибке, если строка некорректна
+     * @return разобранный UUID
+     * @throws IllegalArgumentException строка не является UUID в каноническом виде
      */
-    @PostConstruct
-    void init() {
-        try {
-            Files.createDirectories(props.getStorage().getDirectory());
-            Files.createDirectories(props.getDownload().getDirectory());
-            log.info("Обогащённые кейсы: {}", props.getStorage().getDirectory().toAbsolutePath());
-            log.info("Скачанные кейсы: {}", props.getDownload().getDirectory().toAbsolutePath());
+    public static UUID parseUuid(String value, String errorMessage) {
+        if (value == null || !UUID_PATTERN.matcher(value).matches()) {
+            throw new IllegalArgumentException(errorMessage);
+        }
+        return UUID.fromString(value);
+    }
+
+    /**
+     * Возвращает ссылку для скачивания артефакта по UUID.
+     *
+     * @param id UUID артефакта
+     * @return адрес вида {@code <baseUrl>/api/files/<uuid>}
+     */
+    public String fileUrl(UUID id) {
+        return props.getStorage().getBaseUrl() + "/api/files/" + id;
+    }
+
+    /**
+     * Возвращает ссылку на ZIP-архив обогащённых файлов прогона.
+     *
+     * @param runId идентификатор прогона
+     * @return адрес вида {@code <baseUrl>/api/files/runs/<taskId>/archive}
+     */
+    public String archiveUrl(UUID runId) {
+        return props.getStorage().getBaseUrl() + "/api/files/runs/" + runId + "/archive";
+    }
+
+    /**
+     * Собирает ZIP-архив из артефактов прогона: обогащённые кейсы и индекс, без дубликатов имён.
+     *
+     * @param runId идентификатор прогона
+     * @return байты ZIP-архива
+     * @throws IllegalArgumentException файлов прогона нет
+     * @throws StorageException         архив не удалось собрать
+     */
+    public byte[] buildRunArchive(UUID runId) {
+        List<NamedBytes> entries = new ArrayList<>();
+        for (String kind : List.of(KIND_CASE, KIND_INDEX)) {
+            for (StoredArtifact a : artifacts.findRunFiles(runId, kind)) {
+                entries.add(new NamedBytes(a.filename(), a.content()));
+            }
+        }
+        if (entries.isEmpty()) {
+            throw new IllegalArgumentException("Обогащённые кейсы для прогона не найдены: " + runId);
+        }
+        return zip(entries);
+    }
+
+    /**
+     * Оставляет первое вхождение каждого имени файла.
+     *
+     * @param entries файлы в порядке приоритета
+     * @return файлы без повторов имён
+     */
+    public static List<NamedBytes> uniqueByName(List<NamedBytes> entries) {
+        Map<String, NamedBytes> byName = new LinkedHashMap<>();
+        for (NamedBytes e : entries) {
+            byName.putIfAbsent(e.name(), e);
+        }
+        return new ArrayList<>(byName.values());
+    }
+
+    /**
+     * Собирает ZIP-архив в памяти. Имена без повторов; файлы лежат в корне архива, без каталогов,
+     * потому что индекс ссылается на кейсы относительными путями {@code ./<файл>}.
+     *
+     * @param entries файлы архива
+     * @return байты архива
+     * @throws StorageException запись архива не удалась
+     */
+    public static byte[] zip(List<NamedBytes> entries) {
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        try (ZipOutputStream zip = new ZipOutputStream(buffer, StandardCharsets.UTF_8)) {
+            for (NamedBytes e : uniqueByName(entries)) {
+                zip.putNextEntry(new ZipEntry(e.name()));
+                zip.write(e.content());
+                zip.closeEntry();
+            }
         } catch (IOException e) {
-            throw new StorageException("Не удалось создать директории", e);
+            throw new StorageException("Не удалось собрать архив прогона", e);
         }
-    }
-
-    /**
-     * Сохраняет файл результата и возвращает ссылку на него.
-     * <p>
-     * Содержимое сначала пишется во временный каталог {@code .staging-*} внутри каталога
-     * хранения, затем перемещается в целевой файл с заменой: атомарно, если файловая
-     * система это поддерживает, иначе обычным перемещением. Временный каталог удаляется
-     * в любом случае. Ссылка имеет вид {@code app.storage.base-url}{@code /api/results/<filename>}.
-     *
-     * @param filename имя файла, например {@code TC-1.md}; должно соответствовать {@link #SAFE_NAME}
-     * @param content  текст в кодировке UTF-8
-     * @return сохранённый файл с путём и ссылкой для скачивания
-     * @throws IllegalArgumentException имя файла некорректно
-     * @throws StorageException         не удалось создать временный каталог или записать файл
-     */
-    public SavedFile save(String filename, String content) {
-        if (filename == null || !SAFE_NAME.matcher(filename).matches()) {
-            throw new IllegalArgumentException("Некорректное имя файла: " + filename);
-        }
-        Path targetDir = props.getStorage().getDirectory();
-        Path staging;
-        try {
-            staging = Files.createTempDirectory(targetDir, ".staging-");
-        } catch (IOException e) {
-            throw new StorageException("Не удалось создать staging", e);
-        }
-        try {
-            Path staged = staging.resolve(filename);
-            Files.writeString(staged, content);
-            Path target = targetDir.resolve(filename);
-            moveAtomicallyOrFallback(staged, target);
-            String downloadUrl = props.getStorage().getBaseUrl() + "/api/results/" + filename;
-            return new SavedFile(filename, target, downloadUrl);
-        } catch (IOException e) {
-            throw new StorageException("Не удалось сохранить " + filename, e);
-        } finally {
-            deleteRecursively(staging);
-        }
-    }
-
-    /**
-     * Возвращает ресурс сохранённого файла для отдачи клиенту.
-     * <p>
-     * Путь нормализуется, и результат должен оставаться внутри каталога хранения; иначе
-     * запрос отклоняется. Проверка по {@link #SAFE_NAME} выполняется первой.
-     *
-     * @param filename имя файла результата
-     * @return ресурс файла
-     * @throws IllegalArgumentException имя некорректно, путь выходит за каталог или файл не найден
-     * @throws StorageException         путь нельзя преобразовать в URL
-     */
-    public Resource load(String filename) {
-        if (filename == null || !SAFE_NAME.matcher(filename).matches()) {
-            throw new IllegalArgumentException("Некорректное имя файла");
-        }
-        Path target = props.getStorage().getDirectory().resolve(filename).normalize();
-        if (!target.startsWith(props.getStorage().getDirectory())) {
-            throw new IllegalArgumentException("Некорректный путь");
-        }
-        if (!Files.exists(target)) {
-            throw new IllegalArgumentException("Файл не найден: " + filename);
-        }
-        try {
-            return new UrlResource(target.toUri());
-        } catch (MalformedURLException e) {
-            throw new StorageException("Некорректный путь", e);
-        }
-    }
-
-    /**
-     * Перемещает файл с заменой назначения, по возможности атомарно.
-     * Если файловая система не поддерживает атомарное перемещение, выполняется обычное
-     * перемещение с заменой.
-     *
-     * @param src исходный файл
-     * @param dst целевой путь
-     * @throws IOException перемещение не удалось
-     */
-    private void moveAtomicallyOrFallback(Path src, Path dst) throws IOException {
-        try {
-            Files.move(src, dst, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-        } catch (AtomicMoveNotSupportedException e) {
-            Files.move(src, dst, StandardCopyOption.REPLACE_EXISTING);
-        }
-    }
-
-    /**
-     * Удаляет каталог вместе с содержимым. Ошибки удаления игнорируются: временный
-     * каталог не должен ломать ответ клиенту.
-     *
-     * @param dir каталог для удаления
-     */
-    private void deleteRecursively(Path dir) {
-        try (var walk = Files.walk(dir)) {
-            walk.sorted(Comparator.reverseOrder()).forEach(p -> {
-                try {
-                    Files.deleteIfExists(p);
-                } catch (IOException ignored) {
-                }
-            });
-        } catch (IOException ignored) {
-        }
-    }
-
-    /**
-     * Результат сохранения файла.
-     *
-     * @param filename    имя файла
-     * @param path        путь к сохранённому файлу
-     * @param downloadUrl ссылка для скачивания через API результатов
-     */
-    public record SavedFile(String filename, Path path, String downloadUrl) {
+        return buffer.toByteArray();
     }
 }

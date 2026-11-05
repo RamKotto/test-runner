@@ -14,8 +14,8 @@ import java.util.stream.Collectors;
  * Формирует Markdown-отчёты прогона: обогащённую версию тест-кейса и индекс результатов.
  * <p>
  * Место в конвейере: {@code RunController} вызывает {@link #renderEnriched} для каждого
- * кейса, результат сохраняет {@link EnrichedStorageService}; {@link #renderIndex} строит
- * индекс всех кейсов прогона, который сохраняется тем же способом.
+ * кейса; результат уходит в артефакты прогона (вид {@code enriched_case}); {@link #renderIndex} строит
+ * индекс всех кейсов прогона (вид {@code enriched_index}), который сохраняется тем же способом.
  */
 @Service
 public class TestCaseMarkdownRenderer {
@@ -75,7 +75,7 @@ public class TestCaseMarkdownRenderer {
      * получают метку SNAPSHOT, сравнения ({@code assertApiValueEqualsSnapshot},
      * {@code assertUiTextEqualsSnapshot}) получают метку COMPARE. Пропуск с «каскад»
      * в тексте отчёта получает метку каскадного пропуска, остальные записи получают
-     * общий маркер. Curl, тело запроса, пример ответа и вложенные записи выводятся
+     * общий маркер. Curl, описание (detail), тело запроса, пример ответа и вложенные записи выводятся
      * отдельными блоками, если они заданы. Вложенные записи получают уровень цитирования глубже.
      *
      * @param sb     отчёт, в который дописывается запись

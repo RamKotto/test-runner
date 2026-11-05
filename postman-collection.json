@@ -6,12 +6,12 @@
   },
   "variable": [
     { "key": "baseUrl", "value": "http://localhost:8083", "type": "string" },
-    { "key": "mdToTestsUrl", "value": "http://localhost:8082/api/files/", "type": "string" },
     { "key": "startUrl", "value": "http://localhost:3000", "type": "string" },
     { "key": "apiBaseUrl", "value": "http://localhost:3000/api", "type": "string" },
     { "key": "taskId", "value": "", "type": "string" },
     { "key": "lastStatus", "value": "", "type": "string" },
-    { "key": "firstResultFilename", "value": "", "type": "string" }
+    { "key": "sourceRunId", "value": "", "type": "string", "description": "taskId генерации из md-to-test (POST /api/generate); кейсы читаются из БД по этому значению." },
+    { "key": "runArtifactId", "value": "", "type": "string", "description": "UUID индекса обогащённых кейсов прогона (последний сегмент enrichedIndexUrl ответа POST /api/run)." }
   ],
   "item": [
     {
@@ -29,14 +29,11 @@
               "pm.test('outcomes array', () => pm.expect(json.outcomes).to.be.an('array').that.is.not.empty);",
               "pm.collectionVariables.set('taskId', json.taskId);",
               "pm.collectionVariables.set('lastStatus', json.status);",
-              "if (Array.isArray(json.outcomes) && json.outcomes.length > 0) {",
-              "  const first = json.outcomes[0];",
-              "  if (first.filename) pm.collectionVariables.set('firstResultFilename', first.filename);",
-              "}",
+              "if (json.enrichedIndexUrl) pm.collectionVariables.set('runArtifactId', json.enrichedIndexUrl.split('/').pop());",
               "if (Array.isArray(json.outcomes)) {",
               "  json.outcomes.forEach(o => {",
               "    pm.test('outcome has testCaseId', () => pm.expect(o.testCaseId).to.be.a('string').that.is.not.empty);",
-              "    pm.test('outcome status valid', () => pm.expect(o.status).to.be.oneOf(['PASSED','FAILED','NEEDS_CLARIFICATION']));",
+              "    pm.test('outcome status valid', () => pm.expect(o.status).to.be.oneOf(['PASSED','FAILED','SKIPPED','NEEDS_CLARIFICATION']));",
               "    pm.test('enrichments is array', () => pm.expect(o.enrichments).to.be.an('array'));",
               "    if (Array.isArray(o.enrichments)) {",
               "      o.enrichments.forEach(e => {",
@@ -56,7 +53,7 @@
         "header": [{ "key": "Content-Type", "value": "application/json" }],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"sourceUrl\": \"{{mdToTestsUrl}}\",\n  \"startUrl\": \"{{startUrl}}\",\n  \"apiBaseUrl\": \"{{apiBaseUrl}}\"\n}",
+          "raw": "{\n  \"sourceRunId\": \"{{sourceRunId}}\",\n  \"startUrl\": \"{{startUrl}}\",\n  \"apiBaseUrl\": \"{{apiBaseUrl}}\"\n}",
           "options": { "raw": { "language": "json" } }
         },
         "url": {
@@ -64,7 +61,7 @@
           "host": ["{{baseUrl}}"],
           "path": ["api", "run"]
         },
-        "description": "Скачивает _index.md и все тест-кейсы с md-to-tests, прогоняет их. Если status=NEEDS_CLARIFICATION — переходите к шагу 2."
+        "description": "Читает обогащаемые кейсы из БД по sourceRunId (taskId генерации md-to-test), прогоняет их. Ответ содержит enrichedIndexUrl и archiveUrl. Если status=NEEDS_CLARIFICATION — переходите к шагу 2."
       },
       "response": []
     },
@@ -90,7 +87,7 @@
         "header": [{ "key": "Content-Type", "value": "application/json" }],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"sourceUrl\": \"{{mdToTestsUrl}}\",\n  \"apiBaseUrl\": \"{{apiBaseUrl}}\"\n}",
+          "raw": "{\n  \"sourceRunId\": \"{{sourceRunId}}\",\n  \"apiBaseUrl\": \"{{apiBaseUrl}}\"\n}",
           "options": { "raw": { "language": "json" } }
         },
         "url": {
@@ -122,7 +119,7 @@
         "header": [{ "key": "Content-Type", "value": "application/json" }],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"sourceUrl\": \"http://169.254.169.254/latest/meta-data/\"\n}",
+          "raw": "{\n  \"sourceUrl\": \"http://169.254.169.254/latest/meta-data/tc.md\"\n}",
           "options": { "raw": { "language": "json" } }
         },
         "url": {
@@ -130,7 +127,7 @@
           "host": ["{{baseUrl}}"],
           "path": ["api", "run"]
         },
-        "description": "SSRF-allowlist: чужой хост в sourceUrl → 400."
+        "description": "SSRF-allowlist: прямая ссылка на .md с чужим хостом → 400 (каталог с чужим хостом даёт 502)."
       },
       "response": []
     },
@@ -192,12 +189,13 @@
               "pm.test('status 200', () => pm.response.to.have.status(200));",
               "pm.test('status valid', () => pm.expect(json.status).to.be.oneOf(['DONE','NEEDS_CLARIFICATION']));",
               "pm.collectionVariables.set('lastStatus', json.status);",
+              "if (json.enrichedIndexUrl) pm.collectionVariables.set('runArtifactId', json.enrichedIndexUrl.split('/').pop());",
               "if (json.status === 'DONE') {",
               "  pm.collectionVariables.unset('taskId');",
               "}",
               "if (Array.isArray(json.outcomes)) {",
               "  json.outcomes.forEach(o => {",
-              "    pm.expect(o.status).to.be.oneOf(['PASSED','FAILED','NEEDS_CLARIFICATION']);",
+              "    pm.expect(o.status).to.be.oneOf(['PASSED','FAILED','SKIPPED','NEEDS_CLARIFICATION']);",
               "    pm.expect(o.enrichments).to.be.an('array');",
               "  });",
               "}"
@@ -210,7 +208,7 @@
         "header": [{ "key": "Content-Type", "value": "application/json" }],
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"answers\": [\n    {\n      \"question\": \"Шаг 4: локатор кнопки оплаты\",\n      \"answer\": \"Кнопка имеет id='pay-btn', класс 'btn-primary', текст 'Оплатить'\"\n    },\n    {\n      \"question\": \"Укажите host для API\",\n      \"answer\": \"http://localhost:3000/api\"\n    }\n  ]\n}",
+          "raw": "{\n  \"answers\": [\n    {\n      \"question\": \"[ui_locator_button] Шаг 4 («Нажать кнопку оплаты»): уточните локатор кнопки\",\n      \"answer\": \"Кнопка имеет id='pay-btn', класс 'btn-primary', текст 'Оплатить'\",\n      \"topicKey\": \"ui_locator_button\"\n    },\n    {\n      \"question\": \"[api_base_url] Укажите базовый URL API\",\n      \"answer\": \"http://localhost:3000/api\",\n      \"topicKey\": \"api_base_url\"\n    }\n  ]\n}",
           "options": { "raw": { "language": "json" } }
         },
         "url": {
@@ -218,7 +216,7 @@
           "host": ["{{baseUrl}}"],
           "path": ["api", "run", "{{taskId}}", "answers"]
         },
-        "description": "Отправляет ответы на clarifications. Прогон продолжится с того же тест-кейса. Обогащение появится под шагом, где было уточнение."
+        "description": "Отправляет ответы на clarifications. topicKey берётся из поля clarifications ответа шага 1 (тексты и темы в примере — образцы). Прогон продолжится с того же тест-кейса. Обогащение появится под шагом, где было уточнение."
       },
       "response": []
     },
@@ -255,15 +253,122 @@
       "response": []
     },
     {
-      "name": "3. Скачать обогащённый MD",
+      "name": "2b. Состояние сессии уточнений",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('status 200', () => pm.response.to.have.status(200));",
+              "const json = pm.response.json();",
+              "pm.test('has version', () => pm.expect(json.version).to.be.a('number'));",
+              "pm.test('status valid', () => pm.expect(json.status).to.be.oneOf(['DONE','NEEDS_CLARIFICATION']));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/run/{{taskId}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "run", "{{taskId}}"]
+        },
+        "description": "Состояние сессии уточнений прогона из БД: status, version, round, clarifications, answers, draft и последний ответ (outcomes, enrichedIndexUrl, archiveUrl). Срок хранения 30 дней."
+      },
+      "response": []
+    },
+    {
+      "name": "2c. Черновик ответов",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('status 204', () => pm.response.to.have.status(204));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "PUT",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"draft\":{\"0\":\"черновик ответа\"}}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/run/{{taskId}}/draft",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "run", "{{taskId}}", "draft"]
+        },
+        "description": "Сохраняет черновик ответов на уточнения прогона: draft перезаписывается целиком, version не меняется. Ответ 204."
+      },
+      "response": []
+    },
+    {
+      "name": "2d. Ответ с устаревшей версией → 409",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('status 409', () => pm.response.to.have.status(409));",
+              "pm.test('mentions version conflict', () => pm.expect(pm.response.json().message).to.include('Сессия уже изменена'));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"answers\":[{\"question\":\"x\",\"answer\":\"y\",\"topicKey\":\"z\"}],\"expectedVersion\":0}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{baseUrl}}/api/run/{{taskId}}/answers",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "run", "{{taskId}}", "answers"]
+        },
+        "description": "Передаёт expectedVersion=0, который не совпадает с текущей version сессии → 409 «Сессия уже изменена в другом окне. Обновите страницу.». Тест рассчитан на сессию с version больше 0."
+      },
+      "response": []
+    },
+    {
+      "name": "3. Скачать индекс обогащённых кейсов прогона",
       "event": [
         {
           "listen": "prerequest",
           "script": {
             "type": "text/javascript",
             "exec": [
-              "if (!pm.collectionVariables.get('firstResultFilename')) {",
-              "  console.log('Skipping download: no filename');",
+              "if (!pm.collectionVariables.get('runArtifactId')) {",
+              "  console.log('Skipping download: no artifactId');",
               "  pm.execution.skipRequest();",
               "}"
             ]
@@ -279,7 +384,7 @@
               "pm.test('content-disposition attachment', () => pm.expect(pm.response.headers.get('Content-Disposition')).to.include('attachment'));",
               "const body = pm.response.text();",
               "pm.test('has Шаги', () => pm.expect(body).to.include('## Шаги'));",
-              "pm.test('has enrichment marker', () => pm.expect(body).to.include('> 🔍'));",
+              "pm.test('has enrichment marker', () => pm.expect(body).to.match(/> (?:🔍|📸|⚖️|⏭)/u));",
               "pm.test('has Ожидаемый результат', () => pm.expect(body).to.include('## Ожидаемый результат'));"
             ]
           }
@@ -289,11 +394,11 @@
         "method": "GET",
         "header": [],
         "url": {
-          "raw": "{{baseUrl}}/api/results/{{firstResultFilename}}",
+          "raw": "{{baseUrl}}/api/files/{{runArtifactId}}",
           "host": ["{{baseUrl}}"],
-          "path": ["api", "results", "{{firstResultFilename}}"]
+          "path": ["api", "files", "{{runArtifactId}}"]
         },
-        "description": "Скачивает обогащённый MD. Обогащение пишется строкой '> 🔍' строго под шагом."
+        "description": "Скачивает индекс обогащённых кейсов прогона из БД по UUID (runArtifactId = последний сегмент enrichedIndexUrl ответа /api/run). Под каждым шагом выводится блок-цитата с маркером: 🔍 (действие), 📸 SNAPSHOT, ⚖️ COMPARE или ⏭ SKIP (каскад)."
       },
       "response": []
     },
@@ -314,11 +419,37 @@
         "method": "GET",
         "header": [],
         "url": {
-          "raw": "{{baseUrl}}/api/results/..%2F..%2Fetc%2Fpasswd",
+          "raw": "{{baseUrl}}/api/files/..%2F..%2Fetc%2Fpasswd",
           "host": ["{{baseUrl}}"],
-          "path": ["api", "results", "..%2F..%2Fetc%2Fpasswd"]
+          "path": ["api", "files", "..%2F..%2Fetc%2Fpasswd"]
         },
-        "description": "SAFE_NAME regex отклонит '..' и '/' → 400."
+        "description": "Path traversal (..%2F..%2Fetc%2Fpasswd) вместо UUID: некорректный UUID → 400."
+      },
+      "response": []
+    },
+    {
+      "name": "3b. Архив обогащённых кейсов прогона (ZIP)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('status 200', () => pm.response.to.have.status(200));",
+              "pm.test('content-disposition attachment', () => pm.expect(pm.response.headers.get('Content-Disposition')).to.include('attachment'));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/files/runs/{{taskId}}/archive",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "files", "runs", "{{taskId}}", "archive"]
+        },
+        "description": "ZIP со всеми обогащёнными файлами прогона (taskId). Адрес также приходит в поле archiveUrl ответа POST /api/run. Ответ — вложение (Content-Disposition: attachment)."
       },
       "response": []
     },

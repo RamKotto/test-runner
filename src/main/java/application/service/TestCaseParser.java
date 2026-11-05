@@ -66,7 +66,7 @@ public class TestCaseParser {
 
     /**
      * Извлекает ссылки на файлы кейсов из индекса.
-     * Строки обрабатываются по отдельности, строки без ссылки на {@code .md} пропускаются.
+     * Строки обрабатываются по отдельности, строки без ссылки на {@code .md} пропускаются; в каждой строке берётся первая ссылка.
      * Порядок ссылок сохраняется.
      *
      * @param md текст индекса; не должен быть {@code null}
@@ -138,13 +138,11 @@ public class TestCaseParser {
             String line = rawLine.strip();
             if (line.isEmpty()) continue;
 
-            if (id == null) {
-                Matcher h = HEADER.matcher(line);
-                if (h.matches()) {
-                    id = h.group(1);
-                    title = h.group(2).strip();
-                    continue;
-                }
+            Matcher h = HEADER.matcher(line);
+            if (h.matches()) {
+                if (id == null) id = h.group(1);
+                title = h.group(2).strip();
+                continue;
             }
 
             if (line.startsWith("## ")) {
@@ -188,7 +186,11 @@ public class TestCaseParser {
             }
         }
 
-        if (id == null || title == null || steps.isEmpty()) {
+        if (title == null) {
+            throw new IllegalArgumentException("Не удалось распарсить тест-кейс: " + sourceFilename
+                    + " (не найден заголовок «# TC-ID — название», id=" + id + ")");
+        }
+        if (id == null || steps.isEmpty()) {
             throw new IllegalArgumentException("Не удалось распарсить тест-кейс: " + sourceFilename
                     + " (id=" + id + ", steps=" + steps.size() + ")");
         }

@@ -8,11 +8,8 @@ import application.exception.TargetNotAllowedException;
 import com.microsoft.playwright.*;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -51,7 +48,7 @@ public class UiExecutor {
     private final Browser browser;
 
     /**
-     * Настройки приложения: headless-режим, таймауты Playwright, каталог для HTML-дампов.
+     * Настройки приложения: headless-режим и таймауты Playwright.
      */
     private final AppProperties appProps;
 
@@ -59,13 +56,6 @@ public class UiExecutor {
      * Проверка allowlist-а хостов для стартового URL, навигации и маршрутизации запросов.
      */
     private final TargetUrlGuard targetUrlGuard;
-
-    /**
-     * Флаг сохранения HTML страницы после шагов (свойство {@code app.debug.dump-html},
-     * по умолчанию {@code false}). Внедряется Spring-ом.
-     */
-    @Value("${app.debug.dump-html:false}")
-    private boolean dumpHtmlEnabled;
 
     /**
      * Запускает Playwright и Chromium с настройками {@code app.playwright}.
@@ -292,7 +282,10 @@ public class UiExecutor {
      *       не дольше 10 секунд. Таймаут не зависит от {@code app.playwright}.</li>
      *   <li>{@code assertPageText}: проверяет текст {@code body} без ожидания.</li>
      * </ul>
-     * Любая другая операция, включая {@code null}, отклоняется.
+     * Любая другая операция, включая {@code null}, отклоняется. Операции
+     * {@code snapshotUiText} и {@code assertUiTextEqualsSnapshot} здесь тоже не
+     * выполняются: для них есть отдельные методы {@link #snapshotUiText} и
+     * {@link #assertUiTextEqualsSnapshot}.
      *
      * @param session     сессия, в которой выполняется шаг
      * @param stepIndex   индекс шага, начиная с 0 (в отчёте выводится +1)
@@ -634,7 +627,7 @@ public class UiExecutor {
      * Локатор, который не удалось вычислить, не находит элементов или (при
      * {@code strictAmbiguity}) находит больше одного, даёт {@link LocatorNotResolved}.
      * В сообщении о неоднозначности перечисляются кандидаты с тегом, id, data-testid,
-     * role, aria-label и текстом, а ключ роли берётся из {@code elementRole} плана
+     * role, aria-label и текстом, а ключ роли берётся из {@code elementRole} цели плана
      * или равен {@code "element"}. Нестрогий режим возвращает все совпадения;
      * если их несколько, у локатора добавляется суффикс {@code >> nth=i}.
      *
@@ -773,8 +766,9 @@ public class UiExecutor {
      * ссылок и заголовков с текстом не длиннее 60 символов без переносов строк
      * используется {@code normalize-space()}. Во всех остальных случаях строится
      * путь от ближайшего предка с {@code id} или {@code data-testid} (либо от
-     * корня) с индексами одноимённых соседей. Одинарные кавычки в значениях
-     * экранируются обратным слешем.
+     * корня) с индексами одноимённых соседей. Значения в XPath вставляются через
+     * JS-функцию {@code xpLit}: литерал в {@code '...'}, если нет апострофа; иначе в {@code "..."},
+     * если нет двойных кавычек; иначе {@code concat(...)} из частей.
      *
      * @param page    страница, на которой вычисляется XPath
      * @param locator локатор; берётся первый элемент
@@ -787,16 +781,21 @@ public class UiExecutor {
             if (loc.count() == 0) return null;
             Object result = loc.first().evaluate("""
                         (el) => {
+                            const xpLit = (s) => {
+                                if (!s.includes("'")) return `'${s}'`;
+                                if (!s.includes('"')) return `"${s}"`;
+                                return 'concat(' + s.split("'").map(p => `'${p}'`).join(`, "'", `) + ')';
+                            };
                             const testid = el.getAttribute('data-testid')
                                          || el.getAttribute('data-test-id')
                                          || el.getAttribute('data-test');
-                            if (testid) return `//*[@data-testid='${testid.replace(/'/g, "\\'")}']`;
-                            if (el.id) return `//*[@id='${el.id.replace(/'/g, "\\'")}']`;
+                            if (testid) return `//*[@data-testid=${xpLit(testid)}]`;
+                            if (el.id) return `//*[@id=${xpLit(el.id)}]`;
                             const tag = el.tagName.toLowerCase();
                             const text = (el.innerText || '').trim();
                             if (['button','a','h1','h2','h3','h4','h5','h6'].includes(tag)
                                 && text && text.length <= 60 && !text.includes('\\n')) {
-                                return `//${tag}[normalize-space()='${text.replace(/'/g, "\\'")}']`;
+                                return `//${tag}[normalize-space()=${xpLit(text)}]`;
                             }
                             const parts = [];
                             let cur = el;
@@ -804,8 +803,8 @@ public class UiExecutor {
                                 let part = cur.tagName.toLowerCase();
                                 const cid = cur.id;
                                 const ctestid = cur.getAttribute('data-testid');
-                                if (cid) { parts.unshift(`//*[@id='${cid.replace(/'/g, "\\'")}']`); break; }
-                                if (ctestid) { parts.unshift(`//*[@data-testid='${ctestid.replace(/'/g, "\\'")}']`); break; }
+                                if (cid) { parts.unshift(`//*[@id=${xpLit(cid)}]`); break; }
+                                if (ctestid) { parts.unshift(`//*[@data-testid=${xpLit(ctestid)}]`); break; }
                                 const parent = cur.parentElement;
                                 if (parent) {
                                     const siblings = Array.from(parent.children).filter(c => c.tagName === cur.tagName);
@@ -939,31 +938,6 @@ public class UiExecutor {
             return session.page().url();
         } catch (Exception e) {
             return null;
-        }
-    }
-
-    /**
-     * Сохраняет HTML текущей страницы в {@code app.download.directory} для отладки.
-     * <p>
-     * Ничего не делает, если {@code app.debug.dump-html} выключен. Имя файла имеет вид
-     * {@code <testCaseId>.step<N>.html}, где {@code N} равен {@code stepIndex + 1}.
-     * Значение {@code testCaseId} в имени файла не санитизируется. Ошибки записи
-     * логируются на уровне debug и не пробрасываются.
-     *
-     * @param session    сессия, страница которой сохраняется
-     * @param testCaseId идентификатор тест-кейса, используется в имени файла
-     * @param stepIndex  индекс шага, начиная с 0
-     */
-    public void dumpHtml(UiSession session, String testCaseId, int stepIndex) {
-        if (!dumpHtmlEnabled) return;
-        try {
-            Path dir = appProps.getDownload().getDirectory();
-            Files.createDirectories(dir);
-            Path target = dir.resolve(testCaseId + ".step" + (stepIndex + 1) + ".html");
-            Files.writeString(target, session.page().content());
-            log.debug("dumpHtml: сохранён {}", target.toAbsolutePath());
-        } catch (Exception e) {
-            log.debug("dumpHtml failed: {}", e.getMessage());
         }
     }
 

@@ -7,16 +7,15 @@ import lombok.Data;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.validation.annotation.Validated;
 
-import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 
 /**
  * Настройки приложения с префиксом {@code app} (application.yml и переменные окружения).
  * <p>
- * Корневой объект объединяет секции: хранилище результатов ({@link Storage}), allowlist целевых
+ * Корневой объект объединяет секции: ссылки на артефакты ({@link Storage}), allowlist целевых
  * хостов ({@link Target}), скачивание тест-кейсов ({@link Download}), параметры браузера
- * ({@link Playwright}), сессии уточнений ({@link Sessions}), системный промпт планировщика
+ * ({@link Playwright}), системный промпт планировщика
  * ({@link Prompts}) и параметры планировщика ({@link Planner}). Аннотации Bean Validation
  * проверяются при старте приложения.
  */
@@ -26,7 +25,7 @@ import java.util.List;
 public class AppProperties {
 
     /**
-     * Хранилище обогащённых результатов: каталог и базовый URL для ссылок на файлы.
+     * Ссылки на артефакты в БД: базовый URL для адресов {@code <baseUrl>/api/files/<uuid>} и архива прогона.
      */
     @Valid
     private Storage storage = new Storage();
@@ -38,7 +37,7 @@ public class AppProperties {
     private Target target = new Target();
 
     /**
-     * Скачивание тест-кейсов: каталог копий, таймауты и allowlist хостов-источников.
+     * Скачивание тест-кейсов: таймауты и allowlist хостов-источников.
      */
     @Valid
     private Download download = new Download();
@@ -48,12 +47,6 @@ public class AppProperties {
      */
     @Valid
     private Playwright playwright = new Playwright();
-
-    /**
-     * Параметры хранения сессий уточнений в памяти процесса.
-     */
-    @Valid
-    private Sessions sessions = new Sessions();
 
     /**
      * Системные промпты, передаваемые в LLM.
@@ -74,20 +67,14 @@ public class AppProperties {
     private int enrichmentBodyLimit = 0;
 
     /**
-     * Хранилище обогащённых Markdown-файлов тест-кейсов и индексов прогонов.
+     * Настройки ссылок на артефакты, которые хранятся в таблице {@code qa.artifacts}.
      */
     @Data
     public static class Storage {
 
         /**
-         * Каталог записи обогащённых файлов. По умолчанию {@code ./data/enriched}; в application.yml
-         * задан как {@code ${user.dir}/data/enriched}.
-         */
-        private Path directory = Path.of("./data/enriched");
-
-        /**
-         * Базовый URL сервиса, из которого формируется {@code downloadUrl} вида
-         * {@code <baseUrl>/api/results/<файл>}. Переменная окружения: {@code APP_STORAGE_BASE_URL}.
+         * Базовый URL сервиса, из которого формируются ссылки вида {@code <baseUrl>/api/files/<uuid>}
+         * и архив прогона. Переменная окружения: {@code APP_STORAGE_BASE_URL}.
          */
         @NotBlank
         private String baseUrl = "http://localhost:8083";
@@ -113,13 +100,6 @@ public class AppProperties {
      */
     @Data
     public static class Download {
-
-        /**
-         * Каталог копий скачанных тест-кейсов. Туда же при включённом {@code app.debug.dump-html}
-         * записываются HTML-дампы шагов. По умолчанию {@code ./data/downloaded}; в application.yml
-         * задан как {@code ${user.dir}/data/downloaded}.
-         */
-        private Path directory = Path.of("./data/downloaded");
 
         /**
          * Таймаут установки соединения, в секундах (не меньше 1).
@@ -163,26 +143,6 @@ public class AppProperties {
          */
         @Min(1000)
         private int actionTimeoutMs = 10000;
-    }
-
-    /**
-     * Параметры сессий уточнений, которые хранятся в памяти процесса.
-     */
-    @Data
-    public static class Sessions {
-
-        /**
-         * Время жизни сессии после последнего изменения, в минутах (не меньше 1).
-         */
-        @Min(1)
-        private int ttlMinutes = 180;
-
-        /**
-         * Максимальное число одновременно хранимых сессий (не меньше 1). При переполнении удаляется
-         * самая старая сессия.
-         */
-        @Min(1)
-        private int maxCount = 500;
     }
 
     /**

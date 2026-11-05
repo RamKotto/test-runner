@@ -5,6 +5,7 @@ import application.dto.Dtos.AnswerRequest;
 import application.dto.Dtos.ParsedTestCase;
 import application.dto.Dtos.StepEnrichment;
 import application.exception.GenerationException;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -162,7 +163,8 @@ public class StepPlanner {
          * Для {@code UI} допустимы только {@link StepPlanner#UI_OPS}, для {@code API} только
          * {@link StepPlanner#API_OPS}. Для {@code E2E}, {@code NEGATIVE} и {@code SECURITY}
          * допустима любая из двух групп. Планы {@code skip} и {@code needClarification}
-         * проверки не проходят. Неизвестный тип только логируется, проверка пропускается.
+         * не проверяются и возвращаются без изменений. Неизвестный тип только логируется,
+         * проверка пропускается.
          *
          * @param caseType тип кейса; может быть {@code null}
          * @return этот же план
@@ -207,7 +209,7 @@ public class StepPlanner {
          * {@code locator}, создаётся одна цель с альтернативами из {@code locatorAlternatives}.
          * В остальных случаях список пуст.
          *
-         * @return неизменяемый или непустой список целей; никогда не {@code null}
+         * @return список целей, возможно пустой; никогда не {@code null}
          */
         public List<ElementTarget> effectiveElements() {
             if (elements != null && !elements.isEmpty()) return elements;
@@ -223,14 +225,15 @@ public class StepPlanner {
     /**
      * Разбирает список альтернативных локаторов из строки.
      * <p>
-     * Строка, начинающаяся с {@code [}, разбирается как JSON-массив, и каждый элемент
-     * приводится к тексту. Если разбор не удался или это не массив, строка делится по
-     * запятым. Пустые части отбрасываются, остальные обрезаются. Запятые внутри локатора
-     * (например, в CSS-псевдоклассе) разбивают его на части. Значения {@code null} и
-     * {@code "null"} дают пустой список.
+     * Строка, начинающаяся с {@code [}, разбирается как JSON-массив; каждый элемент
+     * приводится к тексту через {@code asText()} без обрезки и без отбрасывания пустых.
+     * Если разбор не удался или это не массив, строка делится по запятым: пустые части
+     * отбрасываются, остальные обрезаются. Запятые внутри локатора (например, в
+     * CSS-псевдоклассе) разбивают его на части. {@code null}, пустая строка и
+     * {@code "null"} дают пустой неизменяемый список.
      *
      * @param alts строка альтернатив; может быть {@code null}
-     * @return изменяемый список альтернатив, возможно пустой
+     * @return список альтернатив, возможно пустой; изменяемый, кроме случая пустого входа
      */
     private static List<String> splitAlternativesInternal(String alts) {
         if (alts == null || alts.isBlank() || "null".equalsIgnoreCase(alts)) return List.of();
@@ -263,9 +266,10 @@ public class StepPlanner {
      * <p>
      * Ограничения по размеру: DOM обрезается до 40000 символов, тело последнего ответа
      * до 12000, описание каждого выполненного шага до 500, превью снимка до 200. Лимит
-     * {@code app.planner.max-input-chars} в этом методе не проверяется.
+     * {@code app.planner.max-input-chars} в этом методе не проверяется и в коде не используется.
      * <p>
-     * Ответ модели очищается от обёртки {@code ```json} и разбирается через
+     * Ответ модели очищается от открывающей обёртки {@code ```json} и закрывающей {@code ```}
+     * и разбирается через
      * {@link #parsePlans}.
      *
      * @param tc                    тест-кейс
@@ -422,9 +426,11 @@ public class StepPlanner {
     /**
      * Преобразует JSON-объект в {@link Plan}.
      * <p>
-     * Строковые поля берутся через {@link #str}, которое вызывает {@code toString()} у
-     * значения. Поля, переданные моделью не строкой (например, вложенный объект в
-     * {@code bodyJson}), попадают в план как Java-представление, а не как JSON.
+     * Строковые поля берутся через {@link #str}: строка и число переходят в текст как есть,
+     * а вложенный объект или массив (например, {@code bodyJson} в виде объекта) сериализуется
+     * в JSON через {@link ObjectMapper}, поэтому тело запроса остаётся валидным JSON.
+     * {@code requestHeaders} в виде объекта превращается в строки {@code Имя: значение}
+     * (см. {@link #headersField}), потому что так их читает {@link ApiExecutor}.
      * {@code elements} разбирается через {@link #parseElements}, {@code expectedStatus}
      * через {@link #parseExpectedStatus}.
      *
@@ -449,7 +455,7 @@ public class StepPlanner {
                 str(map.get("topicKey")), str(map.get("question")), str(map.get("reason")),
                 str(map.get("locatorStrategy")), str(map.get("elementRole")),
                 str(map.get("elementName")), str(map.get("locatorAlternatives")),
-                elements, str(map.get("requestHeaders")),
+                elements, headersField(map.get("requestHeaders")),
                 str(map.get("snapshotKey")), str(map.get("jsonPath")), str(map.get("attribute"))
         );
     }
@@ -508,13 +514,46 @@ public class StepPlanner {
     }
 
     /**
-     * Приводит значение к строке через {@code toString()}.
+     * Приводит значение поля плана к строке.
+     * <p>
+     * {@code null} остаётся {@code null}. Объект и массив сериализуются в компактный JSON
+     * через {@link ObjectMapper}. Остальные значения (строки, числа, логические) переходят
+     * в текст через {@code toString()}.
      *
      * @param o значение; может быть {@code null}
      * @return строка либо {@code null}
+     * @throws GenerationException объект или массив не удалось сериализовать
      */
-    private static String str(Object o) {
-        return o == null ? null : o.toString();
+    private String str(Object o) {
+        if (o == null) return null;
+        if (o instanceof Map<?, ?> || o instanceof List<?>) {
+            try {
+                return mapper.writeValueAsString(o);
+            } catch (JsonProcessingException e) {
+                throw new GenerationException("Не удалось сериализовать поле плана в JSON: "
+                        + e.getOriginalMessage(), e);
+            }
+        }
+        return o.toString();
+    }
+
+    /**
+     * Приводит поле {@code requestHeaders} плана к виду «одна строка на заголовок».
+     * <p>
+     * Объект {@code {"Имя": "значение"}} превращается в строки {@code Имя: значение}, которые
+     * читает {@link ApiExecutor}. Значения-объекты и массивы внутри него сериализуются в JSON
+     * через {@link #str}. Любое другое значение (строка, {@code null}) передаётся через {@link #str}.
+     *
+     * @param o значение поля из JSON; может быть {@code null}
+     * @return текст заголовков либо {@code null}
+     */
+    private String headersField(Object o) {
+        if (o instanceof Map<?, ?> m) {
+            List<String> lines = new ArrayList<>();
+            m.forEach((k, v) -> lines.add(k + ": " + (v == null ? "" : str(v))));
+            return String.join("\n", lines);
+        }
+        return str(o);
     }
 
     /**

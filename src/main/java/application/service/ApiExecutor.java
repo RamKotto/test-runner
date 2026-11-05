@@ -89,7 +89,7 @@ public class ApiExecutor {
      * Результат операции {@code snapshotApiValue}.
      *
      * @param enrichment запись для отчёта
-     * @param key        имя слота снимка, из {@code plan.snapshotKey()}
+     * @param key        имя слота снимка: {@code plan.snapshotKey()} без пробелов по краям
      * @param value      каноническая JSON-строка выбранного значения
      */
     public record SnapshotResult(StepEnrichment enrichment, String key, String value) {
@@ -110,14 +110,21 @@ public class ApiExecutor {
      * (провал шага, а не запрос уточнения). Редиректы не отслеживаются
      * ({@code follow(false)}), чтобы 3xx на внутренний адрес не обходил проверку
      * allowlist. Заголовки собираются так: сначала {@code headers} кейса, затем
-     * заголовки плана, которые перекрывают одноимённые. Тело отправляется только
+     * заголовки плана, которые перекрывают одноимённые (имя сравнивается с учётом
+     * регистра; {@link HybridCaseRunner} передаёт пустую карту {@code headers}).
+     * Тело отправляется только
      * если оно непустое и не равно {@code "{}"}; при отсутствии Content-Type
      * ставится {@code application/json}.
      * <p>
-     * Идемпотентные методы GET, HEAD и OPTIONS выполняются до 3 раз при ответе
-     * 5xx или сетевом {@link IOException}, с паузой {@code 500 мс × номер попытки}.
-     * Остальные методы выполняются один раз. Если ожидаемый статус задан в плане
-     * и не совпал, шаг завершается провалом.
+     * Повторы выполняются только для GET: до 3 попыток при ответе 5xx
+     * или сетевом {@link IOException}, с паузой {@code 500 мс × номер попытки}.
+     * Поддерживаемые методы: GET, HEAD, OPTIONS, POST, PUT, DELETE, PATCH (через RestAssured).
+      * HEAD, OPTIONS, POST, PUT, DELETE и PATCH выполняются один раз.
+      * Любой другой метод даёт {@link UiExecutor.LocatorNotResolved} («неподдерживаемый HTTP-метод»)
+     * без отправки запроса. Если ожидаемый статус задан в плане
+     * и не совпал, шаг завершается провалом. Для {@code assertStatus} допустимы значения
+     * {@code NNN} и {@code Nxx}; любое другое значение даёт {@link AssertionFailure} с понятным текстом,
+     * которое {@link HybridCaseRunner} переводит в провал шага.
      *
      * @param stepIndex           индекс шага, начиная с 0 (в логах выводится +1)
      * @param plan                план шага от LLM
@@ -132,7 +139,8 @@ public class ApiExecutor {
      *                                       или не получил ответа
      * @throws TargetNotAllowedException     хост URL не входит в {@code app.target.allowed-hosts}
      * @throws UiExecutor.LocatorNotResolved план неполон или некорректен (нет значения,
-     *                                       URL, метода), нужно уточнение
+     *                                       некорректного URL, неподдерживаемого метода),
+     *                                       нужно уточнение
      * @throws IllegalStateException         переданы операции снимков
      */
     public ApiStepResult executeStep(int stepIndex,
@@ -277,9 +285,15 @@ public class ApiExecutor {
         }
 
         if ("assertstatus".equals(op)) {
-            String expected = plan.value();
-            if (expected == null || expected.isBlank()) {
+            String expected = plan.value() == null ? null : plan.value().trim();
+            if (expected == null || expected.isEmpty()) {
                 throw new UiExecutor.LocatorNotResolved("assertStatus: не указано ожидаемое значение");
+            }
+            // Проверка до Integer.parseInt: иначе нечисловое значение дало бы NumberFormatException
+            // и непонятное сообщение «Необработанная ошибка».
+            if (!expected.matches("\\d{3}|[1-5]xx")) {
+                throw new AssertionFailure("assertStatus: некорректное ожидаемое значение `" + expected
+                        + "`, ожидается код из 3 цифр (например 200) или класс ответа 1xx–5xx (например 4xx)");
             }
             if (lastStatusCode == null) {
                 throw new AssertionFailure("assertStatus: нет статуса предыдущего ответа"
@@ -386,8 +400,7 @@ public class ApiExecutor {
         if (pathParams != null && !pathParams.isEmpty()) req.pathParams(pathParams);
         if (hasBody) req.body(bodyJson);
 
-        int attempts = ("GET".equals(method) || "HEAD".equals(method) || "OPTIONS".equals(method))
-                ? 3 : 1;
+        int attempts = "GET".equals(method) ? 3 : 1;
         Response response = null;
         Exception lastEx = null;
 
@@ -395,6 +408,8 @@ public class ApiExecutor {
             try {
                 response = switch (method) {
                     case "GET" -> req.get(uriPath);
+                    case "HEAD" -> req.head(uriPath);
+                    case "OPTIONS" -> req.options(uriPath);
                     case "POST" -> req.post(uriPath);
                     case "PUT" -> req.put(uriPath);
                     case "DELETE" -> req.delete(uriPath);
@@ -455,7 +470,7 @@ public class ApiExecutor {
      * Снимает JSON-значение из тела предыдущего ответа в именованный слот снимка.
      * <p>
      * Путь {@code plan.jsonPath()} приводится к JSON Pointer через
-     * {@link #toJsonPointer(String)}. Значение сохраняется в компактной
+     * {@link #toJsonPointer(String)}; «/», «$» и пустая строка снимают весь ответ. Значение сохраняется в компактной
      * канонической форме (см. {@link #canonicalize(JsonNode)}), чтобы
      * последующее сравнение было побайтовым. Тело ответа не изменяется.
      *
@@ -470,9 +485,9 @@ public class ApiExecutor {
                                            String lastResponseBody) {
         String key = requireSnapshotKey(plan.snapshotKey());
         String path = plan.jsonPath();
-        if (path == null || path.isBlank()) {
+        if (path == null) {
             throw new UiExecutor.LocatorNotResolved(
-                    "snapshotApiValue: не указан jsonPath (напр. `/hourly/temperature_2m` или `$.hourly.temperature_2m`)");
+                    "snapshotApiValue: не указан jsonPath (напр. `/hourly/temperature_2m` или `$.hourly.temperature_2m`; `/` или пустая строка — весь ответ)");
         }
         if (lastResponseBody == null || lastResponseBody.isBlank()) {
             throw new AssertionFailure("snapshotApiValue: нет тела предыдущего ответа"
@@ -485,7 +500,7 @@ public class ApiExecutor {
             throw new AssertionFailure("snapshotApiValue: невалидный JSON: " + e.getMessage());
         }
         String pointer = toJsonPointer(path);
-        JsonNode slice = root.at(pointer);
+        JsonNode slice = pointer.isEmpty() ? root : root.at(pointer);
         if (slice.isMissingNode()) {
             throw new AssertionFailure("snapshotApiValue: jsonPath `" + path
                     + "` (→ `" + pointer + "`) не найден в теле ответа");
@@ -493,7 +508,7 @@ public class ApiExecutor {
         String canonical = canonicalize(slice);
         String preview = truncate(canonical, 240);
         String detail = "snapshotApiValue → snapshot[" + key + "] ← `" + path
-                + "`" + (path.equals(pointer) ? "" : " (→ `" + pointer + "`)")
+                + "`" + pointerNote(path, pointer)
                 + "\n   • length: " + canonical.length() + " chars\n"
                 + "   • preview: " + preview;
         log.info("API-шаг {}: snapshotApiValue key={} path={} pointer={} len={}",
@@ -507,7 +522,7 @@ public class ApiExecutor {
      * Сравнивает JSON-значение из тела текущего ответа со снимком того же ключа.
      * <p>
      * Текущий срез по {@code plan.jsonPath()} канонизируется и сравнивается с
-     * {@code snapshots.get(plan.snapshotKey())} строгим равенством строк. При
+     * {@code snapshots.get(ключ плана без пробелов по краям)} строгим равенством строк. При
      * расхождении в исключении отчёта не остаётся: первое различие
      * ({@link #firstDifference}) попадает только в локальное описание, которое
      * не возвращается вызывающему коду.
@@ -530,7 +545,7 @@ public class ApiExecutor {
                                                       Map<String, String> snapshots) {
         String key = requireSnapshotKey(plan.snapshotKey());
         String path = plan.jsonPath();
-        if (path == null || path.isBlank()) {
+        if (path == null) {
             throw new UiExecutor.LocatorNotResolved(
                     "assertApiValueEqualsSnapshot: не указан jsonPath");
         }
@@ -549,7 +564,7 @@ public class ApiExecutor {
             throw new AssertionFailure("assertApiValueEqualsSnapshot: невалидный JSON");
         }
         String pointer = toJsonPointer(path);
-        JsonNode actualSlice = root.at(pointer);
+        JsonNode actualSlice = pointer.isEmpty() ? root : root.at(pointer);
         if (actualSlice.isMissingNode()) {
             throw new AssertionFailure("assertApiValueEqualsSnapshot: jsonPath `" + path
                     + "` (→ `" + pointer + "`) отсутствует в текущем ответе");
@@ -560,7 +575,7 @@ public class ApiExecutor {
         StringBuilder detail = new StringBuilder("assertApiValueEqualsSnapshot")
                 .append("\n   • snapshotKey: `").append(key).append("`")
                 .append("\n   • jsonPath: `").append(path).append("`")
-                .append(path.equals(pointer) ? "" : " (→ `" + pointer + "`)")
+                .append(pointerNote(path, pointer))
                 .append("\n   • expected length: ").append(reference.length())
                 .append("\n   • actual length: ").append(actual.length())
                 .append("\n   • ").append(equals ? "✅ equal" : "❌ differ");
@@ -584,32 +599,53 @@ public class ApiExecutor {
      * <p>
      * Принимает JSON Pointer как есть ({@code /hourly/temperature_2m}) и путь
      * в стиле JSONPath с корнем {@code $} ({@code $.hourly.temperature_2m}).
-     * Точки в JSONPath заменяются на «/», поэтому ключи, содержащие точку,
-     * и индексы вида {@code [0]} не адресуются. Экранирование {@code ~0} и
-     * {@code ~1} не выполняется. Пустой путь и {@code $} дают {@code "/"}.
+     * Для JSONPath точки заменяются на «/», поэтому ключи, содержащие точку,
+     * и индексы вида {@code [0]} не адресуются. Путь без {@code $} и без ведущего «/»
+     * (например, {@code hourly.temperature_2m}) получает только ведущий «/»;
+     * точки в нём не заменяются. Экранирование {@code ~0} и {@code ~1} не выполняется.
+     * <p>
+     * Корень документа: пустая строка, {@code /} и {@code $} дают пустой указатель {@code ""},
+     * который адресует весь документ (RFC 6901). Снимок такого пути содержит весь ответ
+     * в канонической форме (см. {@link #canonicalize(JsonNode)}). Пустой указатель
+     * не передаётся в {@code JsonNode.at}: вызывающий код берёт корневой узел напрямую.
+     * Путь «/» не трактуется как ключ с пустым именем, поэтому не падает с «не найден».
+     * <p>
+     * Вызывающий код отсекает {@code null} раньше (отсутствующий jsonPath — ошибка плана),
+     * поэтому здесь {@code null} приводится к корню только для полноты.
      *
      * @param raw путь из плана; может быть {@code null}
-     * @return JSON Pointer, начинающийся с {@code /}
+     * @return JSON Pointer (RFC 6901): пустая строка для корня документа, иначе начинается с {@code /}
      */
     private static String toJsonPointer(String raw) {
-        if (raw == null || raw.isBlank()) return "/";
+        if (raw == null) return "";
         String s = raw.trim();
         if (s.startsWith("$")) {
             s = s.substring(1);
-            if (s.isEmpty()) return "/";
             if (s.startsWith(".")) s = s.substring(1);
             s = s.replace('.', '/');
-            if (!s.startsWith("/")) s = "/" + s;
         }
-        if (s.isEmpty()) return "/";
+        if (s.isEmpty() || s.equals("/")) return "";
         if (!s.startsWith("/")) s = "/" + s;
         return s;
     }
 
     /**
+     * Формирует пояснение в отчёте о том, как путь из плана соотнесён с JSON Pointer.
+     *
+     * @param path    путь из плана
+     * @param pointer результат {@link #toJsonPointer(String)}
+     * @return пустая строка, если путь совпал с указателем; пояснение для корня или указатель в скобках
+     */
+    private static String pointerNote(String path, String pointer) {
+        if (pointer.isEmpty()) return " (→ корень документа)";
+        return path.equals(pointer) ? "" : " (→ `" + pointer + "`)";
+    }
+
+    /**
      * Сериализует JSON-узел в компактную строку, которая используется как снимок.
-     * Порядок полей сохраняется так, как он пришёл в ответе. Отсутствующий узел
-     * ({@code null}) даёт строку {@code "null"}.
+     * Порядок полей сохраняется так, как он пришёл в ответе; порядок и формат
+     * не нормализуются. Java-значение {@code null} даёт строку {@code "null"};
+     * отсутствующие узлы (MissingNode) сюда не передаются, их отсекает вызывающий код.
      *
      * @param node узел JSON; может быть {@code null}
      * @return компактная JSON-строка
@@ -682,7 +718,8 @@ public class ApiExecutor {
 
     /**
      * Формирует curl-команду, которой можно воспроизвести запрос (только для отчёта).
-     * Одинарные кавычки в значениях экранируются конструкцией {@code '\''}.
+     * Одинарные кавычки в значениях заголовков и в теле экранируются конструкцией {@code '\''};
+     * URL и имена заголовков не экранируются.
      * Тело добавляется, только если оно непустое и не равно {@code "{}"}.
      *
      * @param method  HTTP-метод
@@ -843,7 +880,8 @@ public class ApiExecutor {
     /**
      * Строит полный URL вызова API.
      * <p>
-     * Абсолютный путь ({@code http://} или {@code https://}) используется как есть.
+     * Абсолютный путь (начинается с {@code http://} или {@code https://}, регистрозависимо)
+     * используется как есть.
      * Относительный путь присоединяется к {@code apiBaseUrl}: завершающий «/» базы
      * убирается, а отсутствующий «/» пути добавляется. {@code null}-путь даёт
      * только базу. Для относительного пути {@code apiBaseUrl} обязан начинаться с

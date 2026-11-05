@@ -11,12 +11,10 @@ spring:
 
 app:
   storage:
-    directory: ${user.dir}/data/enriched
     base-url: ${APP_STORAGE_BASE_URL:http://localhost:8083}
   target:
     allowed-hosts: ${APP_TARGET_ALLOWED_HOSTS:localhost}
   download:
-    directory: ${user.dir}/data/downloaded
     allowed-hosts: ${APP_DOWNLOAD_ALLOWED_HOSTS:localhost}
     connect-timeout-seconds: 10
     read-timeout-seconds: 300
@@ -24,12 +22,7 @@ app:
     headless: true
     navigation-timeout-ms: 30000
     action-timeout-ms: 10000
-  sessions:
-    ttl-minutes: 180
-    max-count: 500
   enrichment-body-limit: 0
-  debug:
-    dump-html: ${APP_DEBUG_DUMP_HTML:false}
   planner:
     max-input-chars: 300000
   prompts:
